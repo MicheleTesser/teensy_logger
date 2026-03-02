@@ -15,6 +15,7 @@
 #include "board.h"
 #include "clock_config.h"
 #include "system_MIMXRT1062.h"
+#include "fsl_iomuxc.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -32,6 +33,7 @@
 #include "diskio.h"
 #include "fsl_sd_disk.h"
 #include "fsl_sdmmc_host.h"
+#include "fsl_flexcan.h"
 #include "sdmmc_config.h"
 
 #if (defined(FSL_FEATURE_SOC_SYSMPU_COUNT) && (FSL_FEATURE_SOC_SYSMPU_COUNT > 0U))
@@ -59,8 +61,22 @@
 #endif
 
 #define APP_TASK_STACK_WORDS 1024U
-#define APP_TASK_PRIORITY    (tskIDLE_PRIORITY + 3U)
-#define LED_BLINK_PERIOD_MS  300U
+#define APP_TASK_PRIORITY    (tskIDLE_PRIORITY + 5U)
+#define LED_TASK_STACK_WORDS 256U
+#define LED_TASK_PRIORITY    (tskIDLE_PRIORITY + 2U)
+#define CAN_TASK_STACK_WORDS 768U
+#define CAN_TASK_PRIORITY    (tskIDLE_PRIORITY + 1U)
+
+#define LED_BLINK_PERIOD_MS     300U
+#define CAN_HEARTBEAT_PERIOD_MS 100U
+#define CAN_DUMP_POLL_PERIOD_MS 2U
+#define CAN_DEFAULT_BITRATE     500000U
+#define CAN_HEARTBEAT_MB        8U
+#define CAN_SHELL_TX_MB         9U
+#define CAN_RX_STD_MB           10U
+#define CAN_RX_EXT_MB           11U
+#define CAN1_HEARTBEAT_ID       0x321U
+#define CAN2_HEARTBEAT_ID       0x322U
 
 #define SHELL_PROMPT           "usb-shell> "
 #define SHELL_LINE_BUFFER_SIZE 256U
@@ -117,10 +133,26 @@ typedef enum
     kLedModeOff
 } led_mode_t;
 
+typedef struct
+{
+    CAN_Type *base;
+    uint8_t heartbeatMb;
+    uint8_t shellTxMb;
+    uint8_t rxStdMb;
+    uint8_t rxExtMb;
+    uint32_t heartbeatId;
+    volatile uint32_t txOkCount;
+    volatile uint32_t txErrCount;
+    volatile uint32_t rxOkCount;
+    volatile uint32_t rxOverflowCount;
+} can_bus_context_t;
+
 /*******************************************************************************
  * Prototypes
  ******************************************************************************/
 static void AppTask(void *pvParameters);
+static void LedTask(void *pvParameters);
+static void CanTask(void *pvParameters);
 static void USB_DeviceApplicationInit(void);
 static void USB_DeviceClockInit(void);
 static void USB_DeviceIsrEnable(void);
@@ -146,6 +178,15 @@ static void FsCommandRemove(const char *path);
 static void FsCommandMkfs(void);
 static void FsCommandBench(uint32_t totalKiB, uint32_t runs);
 static const char *ShellSkipToken(const char *cursor);
+static bool ShellParseU32Auto(const char *text, uint32_t *value);
+
+static status_t CanInitAll(uint32_t bitRate);
+static status_t CanSendFromShell(uint32_t busIndex, uint32_t id, const uint8_t *payload, uint8_t length);
+static void CanCommand(int32_t argc, char *argv[]);
+static status_t CanReleaseStopMode(CAN_Type *base);
+static void CanPollRxDump(void);
+static void CanPollRxDumpMb(can_bus_context_t *bus, size_t busIndex, uint8_t mbIdx);
+static void CanDumpPrintFrame(size_t busIndex, const flexcan_frame_t *frame, status_t status);
 
 static usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, void *param);
 static usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *param);
@@ -189,12 +230,31 @@ USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_sendBuffer[DATA
 static volatile uint32_t s_recvSize = 0U;
 static volatile uint8_t s_txBusy = 0U;
 static volatile uint8_t s_shellSessionReady = 0U;
-static led_mode_t s_ledMode = kLedModeBlink;
+static volatile led_mode_t s_ledMode = kLedModeBlink;
 
 static FATFS s_fsObject;
 static bool s_fsConfigured = false;
 static bool s_fsMounted = false;
 static const TCHAR s_fsDrive[] = {SDDISK + '0', ':', '/', '\0'};
+
+static can_bus_context_t s_canBuses[] = {
+    {.base = CAN1,
+     .heartbeatMb = CAN_HEARTBEAT_MB,
+     .shellTxMb = CAN_SHELL_TX_MB,
+     .rxStdMb = CAN_RX_STD_MB,
+     .rxExtMb = CAN_RX_EXT_MB,
+     .heartbeatId = CAN1_HEARTBEAT_ID},
+    {.base = CAN2,
+     .heartbeatMb = CAN_HEARTBEAT_MB,
+     .shellTxMb = CAN_SHELL_TX_MB,
+     .rxStdMb = CAN_RX_STD_MB,
+     .rxExtMb = CAN_RX_EXT_MB,
+     .heartbeatId = CAN2_HEARTBEAT_ID},
+};
+static volatile bool s_canReady = false;
+static volatile bool s_canHeartbeatEnabled = false;
+static volatile bool s_canDumpEnabled = false;
+static volatile uint32_t s_canBitRate = CAN_DEFAULT_BITRATE;
 
 static usb_device_class_config_struct_t s_cdcAcmConfig[] = {{
     USB_DeviceCdcVcomCallback,
@@ -408,6 +468,26 @@ static bool FsParseU32(const char *text, uint32_t *value)
     }
 
     parsed = strtoul(text, &end, 10);
+    if ((end == text) || ((end != NULL) && (*end != '\0')) || (parsed > UINT32_MAX))
+    {
+        return false;
+    }
+
+    *value = (uint32_t)parsed;
+    return true;
+}
+
+static bool ShellParseU32Auto(const char *text, uint32_t *value)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if ((text == NULL) || (value == NULL) || (text[0] == '\0'))
+    {
+        return false;
+    }
+
+    parsed = strtoul(text, &end, 0);
     if ((end == text) || ((end != NULL) && (*end != '\0')) || (parsed > UINT32_MAX))
     {
         return false;
@@ -913,6 +993,463 @@ static void FsCommand(int32_t argc, char *argv[], const char *rawLine)
     ShellWrite("Comando fs sconosciuto\r\n");
 }
 
+static status_t CanReleaseStopMode(CAN_Type *base)
+{
+    uint32_t stopReqMask = 0U;
+    uint32_t stopAckMask = 0U;
+    uint32_t timeout = 100000U;
+
+    if (base == CAN1)
+    {
+        stopReqMask = IOMUXC_GPR_GPR4_CAN1_STOP_REQ_MASK;
+        stopAckMask = IOMUXC_GPR_GPR4_CAN1_STOP_ACK_MASK;
+    }
+    else if (base == CAN2)
+    {
+        stopReqMask = IOMUXC_GPR_GPR4_CAN2_STOP_REQ_MASK;
+        stopAckMask = IOMUXC_GPR_GPR4_CAN2_STOP_ACK_MASK;
+    }
+
+    if (stopReqMask == 0U)
+    {
+        return kStatus_Success;
+    }
+
+    CLOCK_EnableClock(kCLOCK_Iomuxc);
+    CLOCK_EnableClock(kCLOCK_IomuxcGpr);
+    IOMUXC_GPR->GPR4 &= ~stopReqMask;
+
+    while (((IOMUXC_GPR->GPR4 & stopAckMask) != 0U) && (timeout > 0U))
+    {
+        timeout--;
+    }
+
+    if ((IOMUXC_GPR->GPR4 & stopAckMask) != 0U)
+    {
+        return kStatus_Timeout;
+    }
+
+    return kStatus_Success;
+}
+
+static status_t CanInitOne(can_bus_context_t *bus, uint32_t bitRate)
+{
+    const char *canName = (bus->base == CAN1) ? "CAN1" : ((bus->base == CAN2) ? "CAN2" : "CAN?");
+    flexcan_config_t config;
+    flexcan_rx_mb_config_t rxStdConfig;
+    flexcan_rx_mb_config_t rxExtConfig;
+    status_t status;
+    uint32_t sourceClock = CLOCK_GetClockRootFreq(kCLOCK_CanClkRoot);
+
+    if (sourceClock == 0U)
+    {
+        ShellWriteLinef("%s sorgente clock CAN non valida (0 Hz)\r\n", canName);
+        return kStatus_Fail;
+    }
+
+    status = CanReleaseStopMode(bus->base);
+    if (status != kStatus_Success)
+    {
+        ShellWriteLinef("%s stop-mode timeout GPR4=0x%08lx\r\n", canName, (unsigned long)IOMUXC_GPR->GPR4);
+        return status;
+    }
+
+    FLEXCAN_GetDefaultConfig(&config);
+    config.bitRate          = bitRate;
+    config.maxMbNum         = 16U;
+    config.enableLoopBack   = false;
+    config.enableIndividMask = false;
+    config.disableSelfReception = false;
+    config.enableListenOnlyMode = false;
+
+    FLEXCAN_Init(bus->base, &config, sourceClock);
+
+    if (((bus->base->MCR & CAN_MCR_MDIS_MASK) != 0U) || ((bus->base->MCR & CAN_MCR_LPMACK_MASK) != 0U))
+    {
+        ShellWriteLinef("%s fuori da run mode fallito MCR=0x%08lx\r\n", canName, (unsigned long)bus->base->MCR);
+        return kStatus_Fail;
+    }
+
+    status = FLEXCAN_EnterFreezeMode(bus->base);
+    if (status != kStatus_Success)
+    {
+        ShellWriteLinef("%s enter freeze timeout MCR=0x%08lx\r\n", canName, (unsigned long)bus->base->MCR);
+        return status;
+    }
+
+    status = FLEXCAN_ExitFreezeMode(bus->base);
+    if (status != kStatus_Success)
+    {
+        ShellWriteLinef("%s exit freeze timeout MCR=0x%08lx\r\n", canName, (unsigned long)bus->base->MCR);
+        return status;
+    }
+
+    FLEXCAN_SetTxMbConfig(bus->base, bus->heartbeatMb, true);
+    FLEXCAN_SetTxMbConfig(bus->base, bus->shellTxMb, true);
+    FLEXCAN_SetRxMbGlobalMask(bus->base, 0U);
+
+    rxStdConfig.id     = FLEXCAN_ID_STD(0U);
+    rxStdConfig.format = kFLEXCAN_FrameFormatStandard;
+    rxStdConfig.type   = kFLEXCAN_FrameTypeData;
+    FLEXCAN_SetRxMbConfig(bus->base, bus->rxStdMb, &rxStdConfig, true);
+
+    rxExtConfig.id     = FLEXCAN_ID_EXT(0U);
+    rxExtConfig.format = kFLEXCAN_FrameFormatExtend;
+    rxExtConfig.type   = kFLEXCAN_FrameTypeData;
+    FLEXCAN_SetRxMbConfig(bus->base, bus->rxExtMb, &rxExtConfig, true);
+
+    FLEXCAN_ClearMbStatusFlags(bus->base, ((uint64_t)1U << bus->rxStdMb) | ((uint64_t)1U << bus->rxExtMb));
+
+    bus->txOkCount  = 0U;
+    bus->txErrCount = 0U;
+    bus->rxOkCount = 0U;
+    bus->rxOverflowCount = 0U;
+
+    return kStatus_Success;
+}
+
+static status_t CanSendFrame(can_bus_context_t *bus, uint8_t mbIdx, uint32_t id, const uint8_t *payload, uint8_t length)
+{
+    flexcan_frame_t frame;
+    status_t status;
+
+    if ((bus == NULL) || (length > 8U))
+    {
+        return kStatus_InvalidArgument;
+    }
+
+    (void)memset(&frame, 0, sizeof(frame));
+    frame.type   = (uint32_t)kFLEXCAN_FrameTypeData;
+    frame.length = length;
+    if (id <= 0x7FFU)
+    {
+        frame.format = (uint32_t)kFLEXCAN_FrameFormatStandard;
+        frame.id     = FLEXCAN_ID_STD(id);
+    }
+    else
+    {
+        frame.format = (uint32_t)kFLEXCAN_FrameFormatExtend;
+        frame.id     = FLEXCAN_ID_EXT(id & 0x1FFFFFFFU);
+    }
+
+    frame.dataByte0 = (length > 0U) ? payload[0] : 0U;
+    frame.dataByte1 = (length > 1U) ? payload[1] : 0U;
+    frame.dataByte2 = (length > 2U) ? payload[2] : 0U;
+    frame.dataByte3 = (length > 3U) ? payload[3] : 0U;
+    frame.dataByte4 = (length > 4U) ? payload[4] : 0U;
+    frame.dataByte5 = (length > 5U) ? payload[5] : 0U;
+    frame.dataByte6 = (length > 6U) ? payload[6] : 0U;
+    frame.dataByte7 = (length > 7U) ? payload[7] : 0U;
+
+    status = FLEXCAN_WriteTxMb(bus->base, mbIdx, &frame);
+    if (status == kStatus_Success)
+    {
+        bus->txOkCount++;
+    }
+    else
+    {
+        bus->txErrCount++;
+    }
+    return status;
+}
+
+static void CanDumpPrintFrame(size_t busIndex, const flexcan_frame_t *frame, status_t status)
+{
+    char line[SHELL_TX_LINE_SIZE];
+    uint8_t length;
+    bool isExtended;
+    int32_t pos;
+
+    if (frame == NULL)
+    {
+        return;
+    }
+
+    length = frame->length;
+    if (length > 8U)
+    {
+        length = 8U;
+    }
+    isExtended = (frame->format == (uint32_t)kFLEXCAN_FrameFormatExtend);
+
+    if (isExtended)
+    {
+        pos = snprintf(line, sizeof(line), "can%lu  %08lX   [%u]", (unsigned long)busIndex,
+                       (unsigned long)(frame->id & 0x1FFFFFFFU), (unsigned int)length);
+    }
+    else
+    {
+        pos = snprintf(line, sizeof(line), "can%lu  %03lX   [%u]", (unsigned long)busIndex,
+                       (unsigned long)((frame->id & CAN_ID_STD_MASK) >> CAN_ID_STD_SHIFT), (unsigned int)length);
+    }
+
+    if (pos < 0)
+    {
+        return;
+    }
+
+    if (frame->type == (uint32_t)kFLEXCAN_FrameTypeRemote)
+    {
+        pos += snprintf(line + (size_t)pos, sizeof(line) - (size_t)pos, " RTR");
+    }
+    else
+    {
+        const uint8_t bytes[8] = {frame->dataByte0, frame->dataByte1, frame->dataByte2, frame->dataByte3,
+                                  frame->dataByte4, frame->dataByte5, frame->dataByte6, frame->dataByte7};
+        uint8_t i;
+        for (i = 0U; i < length; i++)
+        {
+            if ((size_t)pos >= sizeof(line))
+            {
+                break;
+            }
+            pos += snprintf(line + (size_t)pos, sizeof(line) - (size_t)pos, " %02X", (unsigned int)bytes[i]);
+        }
+    }
+
+    if (status == kStatus_FLEXCAN_RxOverflow)
+    {
+        if ((size_t)pos < sizeof(line))
+        {
+            pos += snprintf(line + (size_t)pos, sizeof(line) - (size_t)pos, " OVR");
+        }
+    }
+
+    if ((size_t)pos < sizeof(line))
+    {
+        (void)snprintf(line + (size_t)pos, sizeof(line) - (size_t)pos, "\r\n");
+    }
+    line[sizeof(line) - 1U] = '\0';
+    ShellWrite(line);
+}
+
+static void CanPollRxDumpMb(can_bus_context_t *bus, size_t busIndex, uint8_t mbIdx)
+{
+    uint64_t mbMask;
+    flexcan_frame_t frame;
+    status_t status;
+
+    if ((bus == NULL) || !s_canDumpEnabled)
+    {
+        return;
+    }
+
+    mbMask = (uint64_t)1U << mbIdx;
+    if (FLEXCAN_GetMbStatusFlags(bus->base, mbMask) == 0U)
+    {
+        return;
+    }
+
+    FLEXCAN_ClearMbStatusFlags(bus->base, mbMask);
+    status = FLEXCAN_ReadRxMb(bus->base, mbIdx, &frame);
+    if ((status == kStatus_Success) || (status == kStatus_FLEXCAN_RxOverflow))
+    {
+        bus->rxOkCount++;
+        if (status == kStatus_FLEXCAN_RxOverflow)
+        {
+            bus->rxOverflowCount++;
+        }
+        CanDumpPrintFrame(busIndex, &frame, status);
+    }
+}
+
+static void CanPollRxDump(void)
+{
+    size_t i;
+
+    if (!s_canReady || !s_canDumpEnabled)
+    {
+        return;
+    }
+
+    for (i = 0U; i < ARRAY_SIZE(s_canBuses); i++)
+    {
+        CanPollRxDumpMb(&s_canBuses[i], i, s_canBuses[i].rxStdMb);
+        CanPollRxDumpMb(&s_canBuses[i], i, s_canBuses[i].rxExtMb);
+    }
+}
+
+static status_t CanInitAll(uint32_t bitRate)
+{
+    size_t i;
+    uint32_t canRootHz;
+
+    s_canReady = false;
+    s_canDumpEnabled = false;
+
+    /* Match co_device_basic CAN clock setup:
+     * root from USB1 PLL/8 with divider 2 => 20 MHz protocol engine clock.
+     */
+    CLOCK_DisableClock(kCLOCK_Can1);
+    CLOCK_DisableClock(kCLOCK_Can2);
+    CLOCK_DisableClock(kCLOCK_Can1S);
+    CLOCK_DisableClock(kCLOCK_Can2S);
+    CLOCK_SetMux(kCLOCK_CanMux, 0U);
+    CLOCK_SetDiv(kCLOCK_CanDiv, 2U);
+
+    canRootHz = CLOCK_GetClockRootFreq(kCLOCK_CanClkRoot);
+    ShellWriteLinef("CAN clock root=%lu Hz (mux=0 div=2)\r\n", (unsigned long)canRootHz);
+
+    for (i = 0U; i < ARRAY_SIZE(s_canBuses); i++)
+    {
+        ShellWriteLinef("Init CAN%lu...\r\n", (unsigned long)(i + 1U));
+        status_t status = CanInitOne(&s_canBuses[i], bitRate);
+        if (status != kStatus_Success)
+        {
+            ShellWriteLinef("CAN%lu init errore=%ld MCR=0x%08lx ESR1=0x%08lx\r\n", (unsigned long)(i + 1U), (long)status,
+                            (unsigned long)s_canBuses[i].base->MCR, (unsigned long)s_canBuses[i].base->ESR1);
+            return status;
+        }
+    }
+    s_canBitRate = bitRate;
+    s_canReady   = true;
+    return kStatus_Success;
+}
+
+static status_t CanSendFromShell(uint32_t busIndex, uint32_t id, const uint8_t *payload, uint8_t length)
+{
+    if ((busIndex == 0U) || (busIndex > ARRAY_SIZE(s_canBuses)) || !s_canReady)
+    {
+        return kStatus_InvalidArgument;
+    }
+
+    return CanSendFrame(&s_canBuses[busIndex - 1U], s_canBuses[busIndex - 1U].shellTxMb, id, payload, length);
+}
+
+static void CanCommand(int32_t argc, char *argv[])
+{
+    if (argc < 2)
+    {
+        ShellWrite("Uso: can <status|init|hb|dump|send>\r\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "status") == 0)
+    {
+        size_t i;
+        ShellWriteLinef("CAN ready=%u heartbeat=%u dump=%u bitrate=%lu\r\n", s_canReady ? 1U : 0U,
+                        s_canHeartbeatEnabled ? 1U : 0U, s_canDumpEnabled ? 1U : 0U, (unsigned long)s_canBitRate);
+        for (i = 0U; i < ARRAY_SIZE(s_canBuses); i++)
+        {
+            ShellWriteLinef("CAN%lu tx_ok=%lu tx_err=%lu rx_ok=%lu rx_ovf=%lu ESR1=0x%08lx\r\n", (unsigned long)(i + 1U),
+                            (unsigned long)s_canBuses[i].txOkCount, (unsigned long)s_canBuses[i].txErrCount,
+                            (unsigned long)s_canBuses[i].rxOkCount, (unsigned long)s_canBuses[i].rxOverflowCount,
+                            (unsigned long)s_canBuses[i].base->ESR1);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "init") == 0)
+    {
+        uint32_t bitRate = s_canBitRate;
+        status_t status;
+
+        if ((argc >= 3) && !ShellParseU32Auto(argv[2], &bitRate))
+        {
+            ShellWrite("Uso: can init [bitrate]\r\n");
+            return;
+        }
+
+        status = CanInitAll(bitRate);
+        if (status == kStatus_Success)
+        {
+            ShellWriteLinef("CAN inizializzato a %lu bps\r\n", (unsigned long)bitRate);
+        }
+        else
+        {
+            ShellWriteLinef("CAN init fallito: %ld\r\n", (long)status);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "hb") == 0)
+    {
+        if ((argc < 3) || ((strcmp(argv[2], "on") != 0) && (strcmp(argv[2], "off") != 0)))
+        {
+            ShellWrite("Uso: can hb on|off\r\n");
+            return;
+        }
+
+        s_canHeartbeatEnabled = (strcmp(argv[2], "on") == 0);
+        if (s_canHeartbeatEnabled && !s_canReady)
+        {
+            s_canHeartbeatEnabled = false;
+            ShellWrite("CAN non inizializzato. Esegui prima: can init [bitrate]\r\n");
+            return;
+        }
+        ShellWriteLinef("Heartbeat CAN %s\r\n", s_canHeartbeatEnabled ? "ON" : "OFF");
+        return;
+    }
+
+    if (strcmp(argv[1], "dump") == 0)
+    {
+        bool enable;
+
+        if ((argc < 3) || ((strcmp(argv[2], "on") != 0) && (strcmp(argv[2], "off") != 0)))
+        {
+            ShellWrite("Uso: can dump on|off\r\n");
+            return;
+        }
+
+        enable = (strcmp(argv[2], "on") == 0);
+        if (enable && !s_canReady)
+        {
+            ShellWrite("CAN non inizializzato. Esegui prima: can init [bitrate]\r\n");
+            return;
+        }
+
+        s_canDumpEnabled = enable;
+        ShellWriteLinef("CAN dump %s\r\n", s_canDumpEnabled ? "ON" : "OFF");
+        return;
+    }
+
+    if (strcmp(argv[1], "send") == 0)
+    {
+        uint32_t bus;
+        uint32_t id;
+        uint8_t payload[8] = {0};
+        uint8_t length;
+        int32_t i;
+        status_t status;
+
+        if ((argc < 4) || (argc > 12))
+        {
+            ShellWrite("Uso: can send <1|2> <id> [b0 ... b7]\r\n");
+            return;
+        }
+        if (!ShellParseU32Auto(argv[2], &bus) || !ShellParseU32Auto(argv[3], &id))
+        {
+            ShellWrite("Uso: can send <1|2> <id> [b0 ... b7]\r\n");
+            return;
+        }
+
+        length = (uint8_t)(argc - 4);
+        for (i = 0; i < (int32_t)length; i++)
+        {
+            uint32_t byteValue;
+            if (!ShellParseU32Auto(argv[4 + i], &byteValue) || (byteValue > 0xFFU))
+            {
+                ShellWrite("Byte CAN non valido\r\n");
+                return;
+            }
+            payload[i] = (uint8_t)byteValue;
+        }
+
+        status = CanSendFromShell(bus, id, payload, length);
+        if (status == kStatus_Success)
+        {
+            ShellWriteLinef("CAN%lu TX ok id=0x%lx len=%u\r\n", (unsigned long)bus, (unsigned long)id, length);
+        }
+        else
+        {
+            ShellWriteLinef("CAN TX fallita: %ld\r\n", (long)status);
+        }
+        return;
+    }
+
+    ShellWrite("Comando can sconosciuto\r\n");
+}
+
 static void ShellPrintHelp(void)
 {
     ShellWrite("Comandi disponibili:\r\n");
@@ -931,12 +1468,17 @@ static void ShellPrintHelp(void)
     ShellWrite("  fs mkdir <dir>  - crea directory\r\n");
     ShellWrite("  fs mkfs         - formatta FAT e rimonta\r\n");
     ShellWrite("  fs bench [kib] [runs] - benchmark read/write\r\n");
+    ShellWrite("  can status      - stato CAN1/CAN2\r\n");
+    ShellWrite("  can init [bps]  - inizializza CAN1/CAN2 (default 500000)\r\n");
+    ShellWrite("  can hb on|off   - heartbeat periodico sui due CAN\r\n");
+    ShellWrite("  can dump on|off - stampa live dei frame ricevuti (stile candump)\r\n");
+    ShellWrite("  can send <bus> <id> [b0..b7] - invia frame\r\n");
 }
 
 static void ShellHandleLine(char *line)
 {
     char rawLine[SHELL_LINE_BUFFER_SIZE];
-    char *argv[8];
+    char *argv[16];
     int32_t argc = 0;
     char *token;
 
@@ -1015,6 +1557,12 @@ static void ShellHandleLine(char *line)
     if (strcmp(argv[0], "fs") == 0)
     {
         FsCommand(argc, argv, rawLine);
+        return;
+    }
+
+    if (strcmp(argv[0], "can") == 0)
+    {
+        CanCommand(argc, argv);
         return;
     }
 
@@ -1410,11 +1958,98 @@ static void USB_DeviceApplicationInit(void)
 /*******************************************************************************
  * App task
  ******************************************************************************/
+static void LedTask(void *pvParameters)
+{
+    TickType_t lastBlinkTick = xTaskGetTickCount();
+    led_mode_t appliedMode   = kLedModeBlink;
+
+    (void)pvParameters;
+
+    for (;;)
+    {
+        led_mode_t mode = s_ledMode;
+
+        if (mode == kLedModeBlink)
+        {
+            TickType_t now = xTaskGetTickCount();
+            if ((now - lastBlinkTick) >= pdMS_TO_TICKS(LED_BLINK_PERIOD_MS))
+            {
+                USER_LED_TOGGLE();
+                lastBlinkTick = now;
+            }
+            appliedMode = kLedModeBlink;
+            vTaskDelay(pdMS_TO_TICKS(10U));
+        }
+        else if ((mode == kLedModeOn) && (appliedMode != kLedModeOn))
+        {
+            USER_LED_ON();
+            appliedMode = kLedModeOn;
+            vTaskDelay(pdMS_TO_TICKS(20U));
+        }
+        else if ((mode == kLedModeOff) && (appliedMode != kLedModeOff))
+        {
+            USER_LED_OFF();
+            appliedMode = kLedModeOff;
+            vTaskDelay(pdMS_TO_TICKS(20U));
+        }
+        else
+        {
+            vTaskDelay(pdMS_TO_TICKS(20U));
+        }
+    }
+}
+
+static void CanTask(void *pvParameters)
+{
+    uint32_t counter = 0U;
+    TickType_t lastHeartbeatTick = xTaskGetTickCount();
+
+    (void)pvParameters;
+
+    for (;;)
+    {
+        TickType_t now = xTaskGetTickCount();
+
+        if (s_canReady && s_canHeartbeatEnabled &&
+            ((now - lastHeartbeatTick) >= pdMS_TO_TICKS(CAN_HEARTBEAT_PERIOD_MS)))
+        {
+            size_t i;
+            uint8_t payload[8];
+
+            payload[0] = (uint8_t)(counter & 0xFFU);
+            payload[1] = (uint8_t)((counter >> 8U) & 0xFFU);
+            payload[2] = (uint8_t)((counter >> 16U) & 0xFFU);
+            payload[3] = (uint8_t)((counter >> 24U) & 0xFFU);
+            payload[4] = 0xCAU;
+            payload[5] = 0x11U;
+            payload[6] = 0xCAU;
+            payload[7] = 0x22U;
+
+            for (i = 0U; i < ARRAY_SIZE(s_canBuses); i++)
+            {
+                (void)CanSendFrame(&s_canBuses[i], s_canBuses[i].heartbeatMb, s_canBuses[i].heartbeatId, payload, 8U);
+            }
+
+            counter++;
+            lastHeartbeatTick = now;
+        }
+
+        CanPollRxDump();
+
+        if (s_canReady && s_canDumpEnabled)
+        {
+            vTaskDelay(pdMS_TO_TICKS(CAN_DUMP_POLL_PERIOD_MS));
+        }
+        else
+        {
+            vTaskDelay(pdMS_TO_TICKS(10U));
+        }
+    }
+}
+
 static void AppTask(void *pvParameters)
 {
     uint8_t packet[DATA_BUFF_SIZE];
-    TickType_t lastBlinkTick = xTaskGetTickCount();
-    led_mode_t appliedMode   = kLedModeBlink;
 
     (void)pvParameters;
     USB_DeviceApplicationInit();
@@ -1457,27 +2092,6 @@ static void AppTask(void *pvParameters)
             s_shellSessionReady = 0U;
             vTaskDelay(pdMS_TO_TICKS(10U));
         }
-
-        if (s_ledMode == kLedModeBlink)
-        {
-            TickType_t now = xTaskGetTickCount();
-            if ((now - lastBlinkTick) >= pdMS_TO_TICKS(LED_BLINK_PERIOD_MS))
-            {
-                USER_LED_TOGGLE();
-                lastBlinkTick = now;
-            }
-            appliedMode = kLedModeBlink;
-        }
-        else if ((s_ledMode == kLedModeOn) && (appliedMode != kLedModeOn))
-        {
-            USER_LED_ON();
-            appliedMode = kLedModeOn;
-        }
-        else if ((s_ledMode == kLedModeOff) && (appliedMode != kLedModeOff))
-        {
-            USER_LED_OFF();
-            appliedMode = kLedModeOff;
-        }
     }
 }
 
@@ -1492,6 +2106,20 @@ int main(void)
     SystemCoreClockUpdate();
 
     USER_LED_INIT(LOGIC_LED_OFF);
+
+    if (xTaskCreate(LedTask, "led", LED_TASK_STACK_WORDS, NULL, LED_TASK_PRIORITY, NULL) != pdPASS)
+    {
+        while (1)
+        {
+        }
+    }
+
+    if (xTaskCreate(CanTask, "can", CAN_TASK_STACK_WORDS, NULL, CAN_TASK_PRIORITY, NULL) != pdPASS)
+    {
+        while (1)
+        {
+        }
+    }
 
     if (xTaskCreate(AppTask, "usb_shell", APP_TASK_STACK_WORDS, NULL, APP_TASK_PRIORITY, NULL) != pdPASS)
     {

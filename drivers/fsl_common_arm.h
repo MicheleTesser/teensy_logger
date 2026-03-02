@@ -458,6 +458,21 @@ _Pragma("diag_suppress=Pm120")
         void DefaultISR(void);
 #endif
 
+/*!
+ * @def MSDK_REG_SECURE_ADDR(x)
+ * Convert register address to secure alias when building secure image.
+ *
+ * @def MSDK_REG_NONSECURE_ADDR(x)
+ * Convert register address to non-secure alias when building secure image.
+ */
+#if (defined(__ARM_FEATURE_CMSE) && (__ARM_FEATURE_CMSE & 0x2))
+#define MSDK_REG_SECURE_ADDR(x)    ((uintptr_t)(x) | (0x1UL << 28))
+#define MSDK_REG_NONSECURE_ADDR(x) ((uintptr_t)(x) & ~(0x1UL << 28))
+#else
+#define MSDK_REG_SECURE_ADDR(x)    (x)
+#define MSDK_REG_NONSECURE_ADDR(x) (x)
+#endif
+
 /*
  * The fsl_clock.h is included here because it needs MAKE_VERSION/MAKE_STATUS/status_t
  * defined in previous of this file.

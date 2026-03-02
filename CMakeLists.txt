@@ -36,6 +36,7 @@ set(PROJECT_SOURCES
   drivers/fsl_cache.c
   drivers/fsl_common.c
   drivers/fsl_common_arm.c
+  drivers/fsl_flexcan.c
   drivers/fsl_gpio.c
   drivers/fsl_usdhc.c
 
@@ -120,6 +121,7 @@ target_compile_definitions(${PROJECT_TARGET}
     USB_STACK_FREERTOS
     FSL_SDK_ENABLE_DRIVER_CACHE_CONTROL=1
     FSL_FEATURE_HAS_NO_NONCACHEABLE_SECTION=1
+    FLEXCAN_MODULE_TIMEOUT=1000000U
     $<$<CONFIG:Debug>:DEBUG>
     $<$<CONFIG:Release>:NDEBUG>
 )
