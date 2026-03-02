@@ -22,6 +22,7 @@ set(ARM_CPU_FLAGS
 
 set(PROJECT_SOURCES
   source/led_blinky.c
+  source/sdmmc_config.c
   source/semihost_hardfault.c
   source/usb_device_descriptor.c
   startup/startup_mimxrt1062.c
@@ -32,9 +33,11 @@ set(PROJECT_SOURCES
   board/pin_mux.c
 
   drivers/fsl_clock.c
+  drivers/fsl_cache.c
   drivers/fsl_common.c
   drivers/fsl_common_arm.c
   drivers/fsl_gpio.c
+  drivers/fsl_usdhc.c
 
   device/system_MIMXRT1062.c
 
@@ -47,6 +50,16 @@ set(PROJECT_SOURCES
   middleware/usb/device/class/usb_device_class.c
   middleware/usb/device/class/usb_device_cdc_acm.c
   middleware/usb/phy/usb_phy.c
+
+  fatfs/source/ff.c
+  fatfs/source/diskio.c
+  fatfs/source/ffsystem.c
+  fatfs/source/fsl_sd_disk/fsl_sd_disk.c
+
+  sdmmc/common/fsl_sdmmc_common.c
+  sdmmc/osa/fsl_sdmmc_osa.c
+  sdmmc/sd/fsl_sd.c
+  sdmmc/host/usdhc/non_blocking/fsl_sdmmc_host.c
 
   ${FREERTOS_KERNEL_DIR}/list.c
   ${FREERTOS_KERNEL_DIR}/queue.c
@@ -72,12 +85,19 @@ target_include_directories(${PROJECT_TARGET}
     ${CMAKE_CURRENT_SOURCE_DIR}/components/osa/config
     ${CMAKE_CURRENT_SOURCE_DIR}/device
     ${CMAKE_CURRENT_SOURCE_DIR}/drivers
+    ${CMAKE_CURRENT_SOURCE_DIR}/fatfs/source
+    ${CMAKE_CURRENT_SOURCE_DIR}/fatfs/source/fsl_sd_disk
     ${FREERTOS_KERNEL_DIR}/include
     ${FREERTOS_KERNEL_DIR}/portable/GCC/ARM_CM7/r0p1
     ${CMAKE_CURRENT_SOURCE_DIR}/middleware/usb/include
     ${CMAKE_CURRENT_SOURCE_DIR}/middleware/usb/device
     ${CMAKE_CURRENT_SOURCE_DIR}/middleware/usb/device/class
     ${CMAKE_CURRENT_SOURCE_DIR}/middleware/usb/phy
+    ${CMAKE_CURRENT_SOURCE_DIR}/sdmmc/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/sdmmc/osa
+    ${CMAKE_CURRENT_SOURCE_DIR}/sdmmc/sd
+    ${CMAKE_CURRENT_SOURCE_DIR}/sdmmc/host/usdhc
+    ${CMAKE_CURRENT_SOURCE_DIR}/sdmmc/host/usdhc/non_blocking
     ${CMAKE_CURRENT_SOURCE_DIR}/source
     ${CMAKE_CURRENT_SOURCE_DIR}/utilities
     ${CMAKE_CURRENT_SOURCE_DIR}/xip
@@ -95,9 +115,11 @@ target_compile_definitions(${PROJECT_TARGET}
     SDK_DEBUGCONSOLE=2
     SDK_OS_FREE_RTOS
     OSA_USED
+    SD_ENABLED=1
     USE_RTOS=1
     USB_STACK_FREERTOS
     FSL_SDK_ENABLE_DRIVER_CACHE_CONTROL=1
+    FSL_FEATURE_HAS_NO_NONCACHEABLE_SECTION=1
     $<$<CONFIG:Debug>:DEBUG>
     $<$<CONFIG:Release>:NDEBUG>
 )

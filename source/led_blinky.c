@@ -1,10 +1,13 @@
 /*
  * FreeRTOS USB CDC shell for Teensy 4.1 (i.MX RT1062):
- * commands: help, led on, led off, led toggle.
+ * commands: help, led ..., fs ...
  */
 
 #include <ctype.h>
 #include <stdbool.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -24,6 +27,12 @@
 #include "usb_device_ch9.h"
 #include "usb_device_descriptor.h"
 #include "usb_phy.h"
+
+#include "ff.h"
+#include "diskio.h"
+#include "fsl_sd_disk.h"
+#include "fsl_sdmmc_host.h"
+#include "sdmmc_config.h"
 
 #if (defined(FSL_FEATURE_SOC_SYSMPU_COUNT) && (FSL_FEATURE_SOC_SYSMPU_COUNT > 0U))
 #include "fsl_sysmpu.h"
@@ -54,7 +63,13 @@
 #define LED_BLINK_PERIOD_MS  300U
 
 #define SHELL_PROMPT           "usb-shell> "
-#define SHELL_LINE_BUFFER_SIZE 64U
+#define SHELL_LINE_BUFFER_SIZE 256U
+#define SHELL_TX_LINE_SIZE     128U
+
+#define FS_BENCH_FILE_PATH    "/bench.bin"
+#define FS_BENCH_BUFFER_SIZE  4096U
+#define FS_BENCH_DEFAULT_KIB  1024U
+#define FS_BENCH_DEFAULT_RUNS 1U
 
 /* CDC line coding defaults (115200 8N1). */
 #define LINE_CODING_SIZE       (0x07U)
@@ -114,6 +129,23 @@ static void ShellHandleLine(char *line);
 static void ShellSendPrompt(void);
 static void ShellWrite(const char *text);
 static void ShellWriteBytes(const uint8_t *data, uint32_t length);
+static void ShellWriteLinef(const char *fmt, ...);
+static void ShellPrintHelp(void);
+
+static FRESULT FsMount(void);
+static FRESULT FsUnmount(void);
+static bool FsEnsureMounted(void);
+static const char *FsResultToString(FRESULT result);
+static bool FsParseU32(const char *text, uint32_t *value);
+static void FsCommand(int32_t argc, char *argv[], const char *rawLine);
+static void FsCommandList(const char *path);
+static void FsCommandCat(const char *path);
+static void FsCommandWrite(const char *path, const char *payload, bool append);
+static void FsCommandMkDir(const char *path);
+static void FsCommandRemove(const char *path);
+static void FsCommandMkfs(void);
+static void FsCommandBench(uint32_t totalKiB, uint32_t runs);
+static const char *ShellSkipToken(const char *cursor);
 
 static usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, void *param);
 static usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *param);
@@ -123,6 +155,7 @@ static usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event,
  ******************************************************************************/
 extern usb_device_endpoint_struct_t g_UsbDeviceCdcVcomDicEndpoints[];
 extern usb_device_class_struct_t g_UsbDeviceCdcVcomConfig;
+extern void USDHC1_DriverIRQHandler(void);
 
 static usb_cdc_shell_state_t s_cdcState;
 static usb_cdc_acm_info_t s_cdcAcmInfo;
@@ -158,6 +191,11 @@ static volatile uint8_t s_txBusy = 0U;
 static volatile uint8_t s_shellSessionReady = 0U;
 static led_mode_t s_ledMode = kLedModeBlink;
 
+static FATFS s_fsObject;
+static bool s_fsConfigured = false;
+static bool s_fsMounted = false;
+static const TCHAR s_fsDrive[] = {SDDISK + '0', ':', '/', '\0'};
+
 static usb_device_class_config_struct_t s_cdcAcmConfig[] = {{
     USB_DeviceCdcVcomCallback,
     0U,
@@ -181,6 +219,11 @@ void USB_OTG1_IRQHandler(void)
 void USB_OTG2_IRQHandler(void)
 {
     USB_DeviceEhciIsrFunction(s_cdcState.deviceHandle);
+}
+
+void USDHC1_IRQHandler(void)
+{
+    USDHC1_DriverIRQHandler();
 }
 
 /*******************************************************************************
@@ -236,6 +279,640 @@ static void ShellSendPrompt(void)
     ShellWrite(SHELL_PROMPT);
 }
 
+static void ShellWriteLinef(const char *fmt, ...)
+{
+    char line[SHELL_TX_LINE_SIZE];
+    va_list args;
+    int32_t len;
+
+    va_start(args, fmt);
+    len = vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+
+    if (len <= 0)
+    {
+        return;
+    }
+
+    line[sizeof(line) - 1U] = '\0';
+    ShellWrite(line);
+}
+
+static const char *FsResultToString(FRESULT result)
+{
+    switch (result)
+    {
+        case FR_OK:
+            return "FR_OK";
+        case FR_DISK_ERR:
+            return "FR_DISK_ERR";
+        case FR_INT_ERR:
+            return "FR_INT_ERR";
+        case FR_NOT_READY:
+            return "FR_NOT_READY";
+        case FR_NO_FILE:
+            return "FR_NO_FILE";
+        case FR_NO_PATH:
+            return "FR_NO_PATH";
+        case FR_INVALID_NAME:
+            return "FR_INVALID_NAME";
+        case FR_DENIED:
+            return "FR_DENIED";
+        case FR_EXIST:
+            return "FR_EXIST";
+        case FR_INVALID_OBJECT:
+            return "FR_INVALID_OBJECT";
+        case FR_WRITE_PROTECTED:
+            return "FR_WRITE_PROTECTED";
+        case FR_INVALID_DRIVE:
+            return "FR_INVALID_DRIVE";
+        case FR_NOT_ENABLED:
+            return "FR_NOT_ENABLED";
+        case FR_NO_FILESYSTEM:
+            return "FR_NO_FILESYSTEM";
+        case FR_MKFS_ABORTED:
+            return "FR_MKFS_ABORTED";
+        case FR_TIMEOUT:
+            return "FR_TIMEOUT";
+        case FR_LOCKED:
+            return "FR_LOCKED";
+        case FR_NOT_ENOUGH_CORE:
+            return "FR_NOT_ENOUGH_CORE";
+        case FR_TOO_MANY_OPEN_FILES:
+            return "FR_TOO_MANY_OPEN_FILES";
+        case FR_INVALID_PARAMETER:
+            return "FR_INVALID_PARAMETER";
+        default:
+            return "FR_UNKNOWN";
+    }
+}
+
+static FRESULT FsMount(void)
+{
+    FRESULT fr;
+
+    if (!s_fsConfigured)
+    {
+        BOARD_SD_Config(&g_sd, NULL, BOARD_SDMMC_SD_HOST_IRQ_PRIORITY, NULL);
+        s_fsConfigured = true;
+    }
+
+    fr = f_mount(&s_fsObject, s_fsDrive, 1U);
+    if (fr != FR_OK)
+    {
+        s_fsMounted = false;
+        return fr;
+    }
+
+#if (FF_FS_RPATH >= 2U)
+    fr = f_chdrive(s_fsDrive);
+    if (fr != FR_OK)
+    {
+        s_fsMounted = false;
+        return fr;
+    }
+#endif
+
+    s_fsMounted = true;
+    return FR_OK;
+}
+
+static FRESULT FsUnmount(void)
+{
+    FRESULT fr = f_mount(NULL, s_fsDrive, 0U);
+    if (fr == FR_OK)
+    {
+        s_fsMounted = false;
+    }
+    return fr;
+}
+
+static bool FsEnsureMounted(void)
+{
+    if (!s_fsMounted)
+    {
+        ShellWrite("Filesystem non montato. Usa: fs mount\r\n");
+        return false;
+    }
+    return true;
+}
+
+static bool FsParseU32(const char *text, uint32_t *value)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if ((text == NULL) || (value == NULL) || (text[0] == '\0'))
+    {
+        return false;
+    }
+
+    parsed = strtoul(text, &end, 10);
+    if ((end == text) || ((end != NULL) && (*end != '\0')) || (parsed > UINT32_MAX))
+    {
+        return false;
+    }
+
+    *value = (uint32_t)parsed;
+    return true;
+}
+
+static const char *ShellSkipToken(const char *cursor)
+{
+    if (cursor == NULL)
+    {
+        return NULL;
+    }
+
+    while ((*cursor != '\0') && (isspace((unsigned char)*cursor) != 0))
+    {
+        cursor++;
+    }
+
+    while ((*cursor != '\0') && (isspace((unsigned char)*cursor) == 0))
+    {
+        cursor++;
+    }
+
+    while ((*cursor != '\0') && (isspace((unsigned char)*cursor) != 0))
+    {
+        cursor++;
+    }
+
+    return cursor;
+}
+
+static void FsCommandList(const char *path)
+{
+    FRESULT fr;
+    DIR dir;
+    FILINFO info;
+    const char *targetPath = (path != NULL) ? path : "/";
+
+    if (!FsEnsureMounted())
+    {
+        return;
+    }
+
+    fr = f_opendir(&dir, targetPath);
+    if (fr != FR_OK)
+    {
+        ShellWriteLinef("ls fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+        return;
+    }
+
+    ShellWriteLinef("Listing %s\r\n", targetPath);
+    while (true)
+    {
+        const char *name;
+
+        fr = f_readdir(&dir, &info);
+        if (fr != FR_OK)
+        {
+            ShellWriteLinef("readdir fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+            break;
+        }
+
+        if (info.fname[0] == '\0')
+        {
+            break;
+        }
+
+        name = info.fname;
+#if FF_USE_LFN
+        if (name[0] == '\0')
+        {
+            name = info.altname;
+        }
+#endif
+        if (name[0] == '\0')
+        {
+            continue;
+        }
+
+        ShellWriteLinef("%c %10lu %s\r\n", ((info.fattrib & AM_DIR) != 0U) ? 'd' : 'f', (unsigned long)info.fsize, name);
+    }
+
+    (void)f_closedir(&dir);
+}
+
+static void FsCommandCat(const char *path)
+{
+    FRESULT fr;
+    FIL file;
+    UINT read = 0U;
+    uint8_t buffer[128U];
+
+    if ((path == NULL) || (path[0] == '\0'))
+    {
+        ShellWrite("Uso: fs cat <file>\r\n");
+        return;
+    }
+    if (!FsEnsureMounted())
+    {
+        return;
+    }
+
+    fr = f_open(&file, path, FA_READ);
+    if (fr != FR_OK)
+    {
+        ShellWriteLinef("open fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+        return;
+    }
+
+    while (true)
+    {
+        fr = f_read(&file, buffer, sizeof(buffer), &read);
+        if (fr != FR_OK)
+        {
+            ShellWriteLinef("read fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+            break;
+        }
+        if (read == 0U)
+        {
+            break;
+        }
+        ShellWriteBytes(buffer, read);
+    }
+
+    (void)f_close(&file);
+    ShellWrite("\r\n");
+}
+
+static void FsCommandWrite(const char *path, const char *payload, bool append)
+{
+    FRESULT fr;
+    FIL file;
+    UINT written = 0U;
+    uint32_t length;
+    BYTE mode = append ? (BYTE)(FA_OPEN_APPEND | FA_WRITE) : (BYTE)(FA_CREATE_ALWAYS | FA_WRITE);
+
+    if ((path == NULL) || (path[0] == '\0'))
+    {
+        ShellWrite("Uso: fs write <file> <text> | fs append <file> <text>\r\n");
+        return;
+    }
+    if (!FsEnsureMounted())
+    {
+        return;
+    }
+
+    if (payload == NULL)
+    {
+        payload = "";
+    }
+    length = (uint32_t)strlen(payload);
+
+    fr = f_open(&file, path, mode);
+    if (fr != FR_OK)
+    {
+        ShellWriteLinef("open fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+        return;
+    }
+
+    fr = f_write(&file, payload, length, &written);
+    if ((fr == FR_OK) && (written != length))
+    {
+        fr = FR_DISK_ERR;
+    }
+    if (fr == FR_OK)
+    {
+        fr = f_sync(&file);
+    }
+    (void)f_close(&file);
+
+    if (fr != FR_OK)
+    {
+        ShellWriteLinef("write fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+        return;
+    }
+
+    ShellWriteLinef("Scritti %lu byte su %s\r\n", (unsigned long)written, path);
+}
+
+static void FsCommandMkDir(const char *path)
+{
+    FRESULT fr;
+
+    if ((path == NULL) || (path[0] == '\0'))
+    {
+        ShellWrite("Uso: fs mkdir <dir>\r\n");
+        return;
+    }
+    if (!FsEnsureMounted())
+    {
+        return;
+    }
+
+    fr = f_mkdir(path);
+    if (fr == FR_OK)
+    {
+        ShellWriteLinef("Directory creata: %s\r\n", path);
+        return;
+    }
+    if (fr == FR_EXIST)
+    {
+        ShellWriteLinef("Directory gia' esistente: %s\r\n", path);
+        return;
+    }
+
+    ShellWriteLinef("mkdir fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+}
+
+static void FsCommandRemove(const char *path)
+{
+    FRESULT fr;
+
+    if ((path == NULL) || (path[0] == '\0'))
+    {
+        ShellWrite("Uso: fs rm <file-or-dir>\r\n");
+        return;
+    }
+    if (!FsEnsureMounted())
+    {
+        return;
+    }
+
+    fr = f_unlink(path);
+    if (fr != FR_OK)
+    {
+        ShellWriteLinef("rm fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+        return;
+    }
+
+    ShellWriteLinef("Rimosso: %s\r\n", path);
+}
+
+static void FsCommandMkfs(void)
+{
+    FRESULT fr;
+    BYTE work[FF_MAX_SS];
+
+    (void)FsUnmount();
+
+    fr = f_mkfs(s_fsDrive, 0U, work, sizeof(work));
+    if (fr != FR_OK)
+    {
+        ShellWriteLinef("mkfs fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+        return;
+    }
+
+    fr = FsMount();
+    if (fr != FR_OK)
+    {
+        ShellWriteLinef("mkfs ok, mount fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+        return;
+    }
+
+    ShellWrite("mkfs completato e filesystem montato\r\n");
+}
+
+SDK_ALIGN(static uint8_t s_fsBenchBuffer[FS_BENCH_BUFFER_SIZE], 32U);
+
+static void FsCommandBench(uint32_t totalKiB, uint32_t runs)
+{
+    FRESULT fr;
+    FIL file;
+    uint64_t totalBytes;
+    uint32_t run;
+    uint32_t i;
+
+    if (!FsEnsureMounted())
+    {
+        return;
+    }
+    if ((totalKiB == 0U) || (runs == 0U))
+    {
+        ShellWrite("Parametri non validi. Uso: fs bench [kib] [runs]\r\n");
+        return;
+    }
+
+    for (i = 0U; i < sizeof(s_fsBenchBuffer); i++)
+    {
+        s_fsBenchBuffer[i] = (uint8_t)i;
+    }
+
+    totalBytes = (uint64_t)totalKiB * 1024ULL;
+    ShellWriteLinef("Benchmark: %lu KiB x %lu run\r\n", (unsigned long)totalKiB, (unsigned long)runs);
+
+    for (run = 0U; run < runs; run++)
+    {
+        TickType_t writeStart;
+        TickType_t writeEnd;
+        TickType_t readStart;
+        TickType_t readEnd;
+        uint64_t remaining;
+        uint64_t checksum = 0ULL;
+        uint32_t writeMs;
+        uint32_t readMs;
+        uint32_t writeKiBs;
+        uint32_t readKiBs;
+
+        fr = f_open(&file, FS_BENCH_FILE_PATH, FA_CREATE_ALWAYS | FA_WRITE);
+        if (fr != FR_OK)
+        {
+            ShellWriteLinef("bench open write fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+            return;
+        }
+
+        writeStart = xTaskGetTickCount();
+        remaining  = totalBytes;
+        while (remaining > 0ULL)
+        {
+            UINT written = 0U;
+            UINT chunk = (remaining > (uint64_t)sizeof(s_fsBenchBuffer)) ? (UINT)sizeof(s_fsBenchBuffer) : (UINT)remaining;
+
+            fr = f_write(&file, s_fsBenchBuffer, chunk, &written);
+            if ((fr != FR_OK) || (written != chunk))
+            {
+                if (fr == FR_OK)
+                {
+                    fr = FR_DISK_ERR;
+                }
+                break;
+            }
+            remaining -= (uint64_t)written;
+        }
+        if (fr == FR_OK)
+        {
+            fr = f_sync(&file);
+        }
+        writeEnd = xTaskGetTickCount();
+        (void)f_close(&file);
+
+        if (fr != FR_OK)
+        {
+            ShellWriteLinef("bench write fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+            return;
+        }
+
+        fr = f_open(&file, FS_BENCH_FILE_PATH, FA_READ);
+        if (fr != FR_OK)
+        {
+            ShellWriteLinef("bench open read fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+            return;
+        }
+
+        readStart = xTaskGetTickCount();
+        remaining = totalBytes;
+        while (remaining > 0ULL)
+        {
+            UINT read = 0U;
+            UINT chunk = (remaining > (uint64_t)sizeof(s_fsBenchBuffer)) ? (UINT)sizeof(s_fsBenchBuffer) : (UINT)remaining;
+
+            fr = f_read(&file, s_fsBenchBuffer, chunk, &read);
+            if ((fr != FR_OK) || (read != chunk))
+            {
+                if (fr == FR_OK)
+                {
+                    fr = FR_INT_ERR;
+                }
+                break;
+            }
+
+            for (i = 0U; i < read; i++)
+            {
+                checksum += s_fsBenchBuffer[i];
+            }
+
+            remaining -= (uint64_t)read;
+        }
+        readEnd = xTaskGetTickCount();
+        (void)f_close(&file);
+
+        if (fr != FR_OK)
+        {
+            ShellWriteLinef("bench read fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+            return;
+        }
+
+        writeMs = (uint32_t)((writeEnd - writeStart) * portTICK_PERIOD_MS);
+        readMs  = (uint32_t)((readEnd - readStart) * portTICK_PERIOD_MS);
+        if (writeMs == 0U)
+        {
+            writeMs = 1U;
+        }
+        if (readMs == 0U)
+        {
+            readMs = 1U;
+        }
+
+        writeKiBs = (uint32_t)(((totalBytes * 1000ULL) / 1024ULL) / writeMs);
+        readKiBs  = (uint32_t)(((totalBytes * 1000ULL) / 1024ULL) / readMs);
+
+        ShellWriteLinef("run %lu: write=%lu KiB/s (%lu ms), read=%lu KiB/s (%lu ms), checksum=%lu\r\n",
+                        (unsigned long)(run + 1U), (unsigned long)writeKiBs, (unsigned long)writeMs,
+                        (unsigned long)readKiBs, (unsigned long)readMs, (unsigned long)checksum);
+    }
+}
+
+static void FsCommand(int32_t argc, char *argv[], const char *rawLine)
+{
+    if (argc < 2)
+    {
+        ShellWrite("Uso: fs <mount|umount|ls|cat|write|append|rm|mkdir|mkfs|bench>\r\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "mount") == 0)
+    {
+        FRESULT fr = FsMount();
+        if (fr == FR_OK)
+        {
+            ShellWrite("Filesystem montato\r\n");
+        }
+        else
+        {
+            ShellWriteLinef("mount fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "umount") == 0)
+    {
+        FRESULT fr = FsUnmount();
+        if (fr == FR_OK)
+        {
+            ShellWrite("Filesystem smontato\r\n");
+        }
+        else
+        {
+            ShellWriteLinef("umount fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "ls") == 0)
+    {
+        FsCommandList((argc >= 3) ? argv[2] : "/");
+        return;
+    }
+
+    if (strcmp(argv[1], "cat") == 0)
+    {
+        FsCommandCat((argc >= 3) ? argv[2] : NULL);
+        return;
+    }
+
+    if ((strcmp(argv[1], "write") == 0) || (strcmp(argv[1], "append") == 0))
+    {
+        const char *payload;
+        const char *cursor = rawLine;
+        bool append = (strcmp(argv[1], "append") == 0);
+
+        if (argc < 3)
+        {
+            ShellWrite("Uso: fs write <file> <text> | fs append <file> <text>\r\n");
+            return;
+        }
+
+        cursor  = ShellSkipToken(cursor);
+        cursor  = ShellSkipToken(cursor);
+        payload = ShellSkipToken(cursor);
+        FsCommandWrite(argv[2], payload, append);
+        return;
+    }
+
+    if (strcmp(argv[1], "rm") == 0)
+    {
+        FsCommandRemove((argc >= 3) ? argv[2] : NULL);
+        return;
+    }
+
+    if (strcmp(argv[1], "mkdir") == 0)
+    {
+        FsCommandMkDir((argc >= 3) ? argv[2] : NULL);
+        return;
+    }
+
+    if (strcmp(argv[1], "mkfs") == 0)
+    {
+        FsCommandMkfs();
+        return;
+    }
+
+    if (strcmp(argv[1], "bench") == 0)
+    {
+        uint32_t kib = FS_BENCH_DEFAULT_KIB;
+        uint32_t runs = FS_BENCH_DEFAULT_RUNS;
+
+        if ((argc >= 3) && !FsParseU32(argv[2], &kib))
+        {
+            ShellWrite("Uso: fs bench [kib] [runs]\r\n");
+            return;
+        }
+        if ((argc >= 4) && !FsParseU32(argv[3], &runs))
+        {
+            ShellWrite("Uso: fs bench [kib] [runs]\r\n");
+            return;
+        }
+        FsCommandBench(kib, runs);
+        return;
+    }
+
+    ShellWrite("Comando fs sconosciuto\r\n");
+}
+
 static void ShellPrintHelp(void)
 {
     ShellWrite("Comandi disponibili:\r\n");
@@ -244,13 +921,28 @@ static void ShellPrintHelp(void)
     ShellWrite("  led on          - accende il LED\r\n");
     ShellWrite("  led off         - spegne il LED\r\n");
     ShellWrite("  led toggle      - alterna on/off (modo manuale)\r\n");
+    ShellWrite("  fs mount        - monta la SD con FatFs\r\n");
+    ShellWrite("  fs umount       - smonta la SD\r\n");
+    ShellWrite("  fs ls [path]    - lista directory\r\n");
+    ShellWrite("  fs cat <file>   - stampa file\r\n");
+    ShellWrite("  fs write <f> <t>- sovrascrive file con testo\r\n");
+    ShellWrite("  fs append <f> <t>- aggiunge testo a file\r\n");
+    ShellWrite("  fs rm <path>    - elimina file/directory vuota\r\n");
+    ShellWrite("  fs mkdir <dir>  - crea directory\r\n");
+    ShellWrite("  fs mkfs         - formatta FAT e rimonta\r\n");
+    ShellWrite("  fs bench [kib] [runs] - benchmark read/write\r\n");
 }
 
 static void ShellHandleLine(char *line)
 {
-    char *argv[3];
+    char rawLine[SHELL_LINE_BUFFER_SIZE];
+    char *argv[8];
     int32_t argc = 0;
-    char *token  = strtok(line, " \t");
+    char *token;
+
+    (void)strncpy(rawLine, line, sizeof(rawLine) - 1U);
+    rawLine[sizeof(rawLine) - 1U] = '\0';
+    token = strtok(line, " \t");
 
     while ((token != NULL) && (argc < (int32_t)(sizeof(argv) / sizeof(argv[0]))))
     {
@@ -317,6 +1009,12 @@ static void ShellHandleLine(char *line)
         }
 
         ShellWrite("Uso: led blink|on|off|toggle\r\n");
+        return;
+    }
+
+    if (strcmp(argv[0], "fs") == 0)
+    {
+        FsCommand(argc, argv, rawLine);
         return;
     }
 
