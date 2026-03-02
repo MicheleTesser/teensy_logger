@@ -12,6 +12,7 @@ endif()
 
 set(PROJECT_TARGET "${PROJECT_NAME}.elf")
 set(LINKER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/MIMXRT1062_flash.ld")
+set(FREERTOS_KERNEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/FreeRTOS-Kernel")
 set(ARM_CPU_FLAGS
   -mcpu=cortex-m7
   -mthumb
@@ -22,6 +23,7 @@ set(ARM_CPU_FLAGS
 set(PROJECT_SOURCES
   source/led_blinky.c
   source/semihost_hardfault.c
+  source/usb_device_descriptor.c
   startup/startup_mimxrt1062.c
 
   board/board.c
@@ -33,9 +35,26 @@ set(PROJECT_SOURCES
   drivers/fsl_common.c
   drivers/fsl_common_arm.c
   drivers/fsl_gpio.c
-  drivers/fsl_lpuart.c
 
   device/system_MIMXRT1062.c
+
+  component/lists/fsl_component_generic_list.c
+  components/osa/fsl_os_abstraction_free_rtos.c
+
+  middleware/usb/device/usb_device_ch9.c
+  middleware/usb/device/usb_device_dci.c
+  middleware/usb/device/usb_device_ehci.c
+  middleware/usb/device/class/usb_device_class.c
+  middleware/usb/device/class/usb_device_cdc_acm.c
+  middleware/usb/phy/usb_phy.c
+
+  ${FREERTOS_KERNEL_DIR}/list.c
+  ${FREERTOS_KERNEL_DIR}/queue.c
+  ${FREERTOS_KERNEL_DIR}/tasks.c
+  ${FREERTOS_KERNEL_DIR}/event_groups.c
+  ${FREERTOS_KERNEL_DIR}/timers.c
+  ${FREERTOS_KERNEL_DIR}/portable/GCC/ARM_CM7/r0p1/port.c
+  ${FREERTOS_KERNEL_DIR}/portable/MemMang/heap_4.c
 
   xip/evkbmimxrt1060_flexspi_nor_config.c
   xip/fsl_flexspi_nor_boot.c
@@ -49,10 +68,17 @@ target_include_directories(${PROJECT_TARGET}
     ${CMAKE_CURRENT_SOURCE_DIR}/CMSIS
     ${CMAKE_CURRENT_SOURCE_DIR}/board
     ${CMAKE_CURRENT_SOURCE_DIR}/component/lists
-    ${CMAKE_CURRENT_SOURCE_DIR}/component/serial_manager
-    ${CMAKE_CURRENT_SOURCE_DIR}/component/uart
+    ${CMAKE_CURRENT_SOURCE_DIR}/components/osa
+    ${CMAKE_CURRENT_SOURCE_DIR}/components/osa/config
     ${CMAKE_CURRENT_SOURCE_DIR}/device
     ${CMAKE_CURRENT_SOURCE_DIR}/drivers
+    ${FREERTOS_KERNEL_DIR}/include
+    ${FREERTOS_KERNEL_DIR}/portable/GCC/ARM_CM7/r0p1
+    ${CMAKE_CURRENT_SOURCE_DIR}/middleware/usb/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/middleware/usb/device
+    ${CMAKE_CURRENT_SOURCE_DIR}/middleware/usb/device/class
+    ${CMAKE_CURRENT_SOURCE_DIR}/middleware/usb/phy
+    ${CMAKE_CURRENT_SOURCE_DIR}/source
     ${CMAKE_CURRENT_SOURCE_DIR}/utilities
     ${CMAKE_CURRENT_SOURCE_DIR}/xip
 )
@@ -66,8 +92,11 @@ target_compile_definitions(${PROJECT_TARGET}
     XIP_BOOT_HEADER_ENABLE=1
     XIP_BOOT_HEADER_DCD_ENABLE=0
     SKIP_SYSCLK_INIT=1
-    SDK_DEBUGCONSOLE=0
-    SERIAL_PORT_TYPE_UART=1
+    SDK_DEBUGCONSOLE=2
+    SDK_OS_FREE_RTOS
+    OSA_USED
+    USE_RTOS=1
+    USB_STACK_FREERTOS
     FSL_SDK_ENABLE_DRIVER_CACHE_CONTROL=1
     $<$<CONFIG:Debug>:DEBUG>
     $<$<CONFIG:Release>:NDEBUG>
