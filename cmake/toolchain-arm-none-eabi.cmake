@@ -1,0 +1,13 @@
+set(CMAKE_SYSTEM_NAME Generic)
+set(CMAKE_SYSTEM_PROCESSOR arm)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+
+find_program(ARM_NONE_EABI_GCC arm-none-eabi-gcc REQUIRED)
+find_program(ARM_NONE_EABI_GXX arm-none-eabi-g++ REQUIRED)
+find_program(ARM_NONE_EABI_GCC_AR arm-none-eabi-gcc-ar REQUIRED)
+find_program(ARM_NONE_EABI_GCC_RANLIB arm-none-eabi-gcc-ranlib REQUIRED)
+
+set(CMAKE_C_COMPILER "${ARM_NONE_EABI_GCC}")
+set(CMAKE_CXX_COMPILER "${ARM_NONE_EABI_GXX}")
+set(CMAKE_AR "${ARM_NONE_EABI_GCC_AR}")
+set(CMAKE_RANLIB "${ARM_NONE_EABI_GCC_RANLIB}")
