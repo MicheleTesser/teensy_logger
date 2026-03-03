@@ -21,6 +21,7 @@ set(ARM_CPU_FLAGS
 )
 
 set(PROJECT_SOURCES
+  source/FreeRTOS_CLI.c
   source/led_blinky.c
   source/sdmmc_config.c
   source/semihost_hardfault.c
