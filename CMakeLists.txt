@@ -22,7 +22,12 @@ set(ARM_CPU_FLAGS
 
 set(PROJECT_SOURCES
   source/FreeRTOS_CLI.c
-  source/led_blinky.c
+  source/led_blinky_data.c
+  source/led_blinky_usb_shell.c
+  source/led_blinky_rtc_fs.c
+  source/led_blinky_can_core_mf4.c
+  source/led_blinky_can_shell_gs.c
+  source/led_blinky_usb_tasks_main.c
   source/sdmmc_config.c
   source/semihost_hardfault.c
   source/usb_device_descriptor.c

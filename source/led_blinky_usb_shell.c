@@ -1,3 +1,40 @@
+#include "led_blinky_shared.h"
+
+static const CLI_Command_Definition_t s_cliHelpCommand = {
+    .pcCommand = "help",
+    .pcHelpString = "help: mostra i comandi disponibili\r\n",
+    .pxCommandInterpreter = ShellCliHelpCommand,
+    .cExpectedNumberOfParameters = 0,
+};
+
+static const CLI_Command_Definition_t s_cliLedCommand = {
+    .pcCommand = "led",
+    .pcHelpString = "led <status|activity|on|off>\r\n",
+    .pxCommandInterpreter = ShellCliLedCommand,
+    .cExpectedNumberOfParameters = -1,
+};
+
+static const CLI_Command_Definition_t s_cliCanCommand = {
+    .pcCommand = "can",
+    .pcHelpString = "can <status|util|clear>\r\n",
+    .pxCommandInterpreter = ShellCliCanCommand,
+    .cExpectedNumberOfParameters = -1,
+};
+
+static const CLI_Command_Definition_t s_cliSdCommand = {
+    .pcCommand = "sd",
+    .pcHelpString = "sd status: spazio SD totale/libero/usato\r\n",
+    .pxCommandInterpreter = ShellCliSdCommand,
+    .cExpectedNumberOfParameters = -1,
+};
+
+static const CLI_Command_Definition_t s_cliRtcCommand = {
+    .pcCommand = "rtc",
+    .pcHelpString = "rtc <status|set <unix_epoch>>\r\n",
+    .pxCommandInterpreter = ShellCliRtcCommand,
+    .cExpectedNumberOfParameters = -1,
+};
+
 /*
  * Module: USB IRQ glue + CDC shell I/O + CLI production commands + gs_usb frame queue helpers.
  */
@@ -22,7 +59,7 @@ void USDHC1_IRQHandler(void)
 /*******************************************************************************
  * Helpers
  ******************************************************************************/
-static void ShellWriteBytes(const uint8_t *data, uint32_t length)
+void ShellWriteBytes(const uint8_t *data, uint32_t length)
 {
     BaseType_t locked = pdFALSE;
     uint32_t waitTicks;
@@ -86,7 +123,7 @@ static void ShellWriteBytes(const uint8_t *data, uint32_t length)
     }
 }
 
-static void ShellWrite(const char *text)
+void ShellWrite(const char *text)
 {
     if (text == NULL)
     {
@@ -95,7 +132,7 @@ static void ShellWrite(const char *text)
     ShellWriteBytes((const uint8_t *)text, (uint32_t)strlen(text));
 }
 
-static bool ShellWriteBytesTry(const uint8_t *data, uint32_t length)
+bool ShellWriteBytesTry(const uint8_t *data, uint32_t length)
 {
     BaseType_t locked = pdFALSE;
     usb_status_t status;
@@ -142,7 +179,7 @@ static bool ShellWriteBytesTry(const uint8_t *data, uint32_t length)
     return (status == kStatus_USB_Success);
 }
 
-static bool ShellWriteTry(const char *text)
+bool ShellWriteTry(const char *text)
 {
     if (text == NULL)
     {
@@ -151,12 +188,12 @@ static bool ShellWriteTry(const char *text)
     return ShellWriteBytesTry((const uint8_t *)text, (uint32_t)strlen(text));
 }
 
-static void ShellSendPrompt(void)
+void ShellSendPrompt(void)
 {
     ShellWrite(SHELL_PROMPT);
 }
 
-static void ShellWriteLinef(const char *fmt, ...)
+void ShellWriteLinef(const char *fmt, ...)
 {
     char line[SHELL_TX_LINE_SIZE];
     va_list args;
@@ -175,7 +212,7 @@ static void ShellWriteLinef(const char *fmt, ...)
     ShellWrite(line);
 }
 
-static bool ShellTokenEquals(const char *token, BaseType_t tokenLen, const char *value)
+bool ShellTokenEquals(const char *token, BaseType_t tokenLen, const char *value)
 {
     size_t valueLen;
 
@@ -188,7 +225,7 @@ static bool ShellTokenEquals(const char *token, BaseType_t tokenLen, const char 
     return ((size_t)tokenLen == valueLen) && (strncmp(token, value, valueLen) == 0);
 }
 
-static void ShellCliInit(void)
+void ShellCliInit(void)
 {
     if (s_shellCliReady)
     {
@@ -219,7 +256,7 @@ static void ShellCliInit(void)
     s_shellCliReady = true;
 }
 
-static BaseType_t ShellCliHelpCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
+BaseType_t ShellCliHelpCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
 {
     (void)pcCommandString;
     (void)snprintf(pcWriteBuffer, xWriteBufferLen,
@@ -234,7 +271,7 @@ static BaseType_t ShellCliHelpCommand(char *pcWriteBuffer, size_t xWriteBufferLe
     return pdFALSE;
 }
 
-static BaseType_t ShellCliLedCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
+BaseType_t ShellCliLedCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
 {
     const char *subcmd;
     BaseType_t subcmdLen = 0;
@@ -288,7 +325,7 @@ static BaseType_t ShellCliLedCommand(char *pcWriteBuffer, size_t xWriteBufferLen
     return pdFALSE;
 }
 
-static BaseType_t ShellCliCanCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
+BaseType_t ShellCliCanCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
 {
     const char *subcmd;
     BaseType_t subcmdLen = 0;
@@ -355,7 +392,7 @@ static BaseType_t ShellCliCanCommand(char *pcWriteBuffer, size_t xWriteBufferLen
     return pdFALSE;
 }
 
-static BaseType_t ShellCliSdCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
+BaseType_t ShellCliSdCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
 {
     const char *subcmd;
     BaseType_t subcmdLen = 0;
@@ -412,7 +449,7 @@ static BaseType_t ShellCliSdCommand(char *pcWriteBuffer, size_t xWriteBufferLen,
     return pdFALSE;
 }
 
-static BaseType_t ShellCliRtcCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
+BaseType_t ShellCliRtcCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
 {
     const char *subcmd;
     BaseType_t subcmdLen = 0;
@@ -470,25 +507,25 @@ static BaseType_t ShellCliRtcCommand(char *pcWriteBuffer, size_t xWriteBufferLen
     return pdFALSE;
 }
 
-static void LedMarkCanActivity(void)
+void LedMarkCanActivity(void)
 {
     s_ledActivityLastTick = xTaskGetTickCount();
     s_ledActivitySeen = true;
 }
 
-static uint32_t GsBswap32(uint32_t value)
+uint32_t GsBswap32(uint32_t value)
 {
     return ((value & 0x000000FFUL) << 24U) | ((value & 0x0000FF00UL) << 8U) | ((value & 0x00FF0000UL) >> 8U) |
            ((value & 0xFF000000UL) >> 24U);
 }
 
-static bool GsIsLittleEndianHost(void)
+bool GsIsLittleEndianHost(void)
 {
     const uint16_t marker = 0x0001U;
     return (*(const uint8_t *)&marker) == 0x01U;
 }
 
-static uint32_t GsToLe32(uint32_t value)
+uint32_t GsToLe32(uint32_t value)
 {
     if (GsIsLittleEndianHost())
     {
@@ -497,7 +534,7 @@ static uint32_t GsToLe32(uint32_t value)
     return GsBswap32(value);
 }
 
-static uint32_t GsFromLe32(uint32_t value)
+uint32_t GsFromLe32(uint32_t value)
 {
     if (GsIsLittleEndianHost())
     {
@@ -506,7 +543,7 @@ static uint32_t GsFromLe32(uint32_t value)
     return GsBswap32(value);
 }
 
-static uint32_t GsWireToCpu32(uint32_t value)
+uint32_t GsWireToCpu32(uint32_t value)
 {
     if (s_gsCanHostLe)
     {
@@ -515,7 +552,7 @@ static uint32_t GsWireToCpu32(uint32_t value)
     return value;
 }
 
-static uint32_t GsCpuToWire32(uint32_t value)
+uint32_t GsCpuToWire32(uint32_t value)
 {
     if (s_gsCanHostLe)
     {
@@ -524,7 +561,7 @@ static uint32_t GsCpuToWire32(uint32_t value)
     return value;
 }
 
-static bool GsCanQueueFrame(const gs_host_frame_classic_t *frame)
+bool GsCanQueueFrame(const gs_host_frame_classic_t *frame)
 {
     bool queued = false;
 
@@ -549,7 +586,7 @@ static bool GsCanQueueFrame(const gs_host_frame_classic_t *frame)
     return queued;
 }
 
-static void GsCanTrySendNext(void)
+void GsCanTrySendNext(void)
 {
     gs_host_frame_classic_t nextFrame;
     usb_status_t status;
@@ -590,7 +627,7 @@ static void GsCanTrySendNext(void)
     }
 }
 
-static void GsCanSetOverflowFlag(size_t busIndex)
+void GsCanSetOverflowFlag(size_t busIndex)
 {
     if (busIndex < GS_USB_CHANNEL_COUNT)
     {
@@ -598,7 +635,7 @@ static void GsCanSetOverflowFlag(size_t busIndex)
     }
 }
 
-static bool GsCanRxPublish(size_t busIndex, const flexcan_frame_t *frame, status_t status)
+bool GsCanRxPublish(size_t busIndex, const flexcan_frame_t *frame, status_t status)
 {
     gs_host_frame_classic_t hostFrame;
     uint32_t canId;
@@ -662,7 +699,7 @@ static bool GsCanRxPublish(size_t busIndex, const flexcan_frame_t *frame, status
     return queued;
 }
 
-static bool GsCanTxEchoPublish(size_t busIndex, uint32_t echoId, const flexcan_frame_t *frame)
+bool GsCanTxEchoPublish(size_t busIndex, uint32_t echoId, const flexcan_frame_t *frame)
 {
     gs_host_frame_classic_t hostFrame;
     uint32_t canId;
@@ -717,7 +754,7 @@ static bool GsCanTxEchoPublish(size_t busIndex, uint32_t echoId, const flexcan_f
     return GsCanQueueFrame(&hostFrame);
 }
 
-static bool GsCanFillBtConst(uint8_t channel, gs_device_bt_const_t *btConst)
+bool GsCanFillBtConst(uint8_t channel, gs_device_bt_const_t *btConst)
 {
     uint32_t canClock;
 
@@ -755,7 +792,7 @@ static bool GsCanFillBtConst(uint8_t channel, gs_device_bt_const_t *btConst)
     return true;
 }
 
-static uint8_t GsCanDecodeChannelFromSetup(const usb_setup_struct_t *setup)
+uint8_t GsCanDecodeChannelFromSetup(const usb_setup_struct_t *setup)
 {
     uint8_t channelLo;
     uint8_t channelHi;

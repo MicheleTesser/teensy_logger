@@ -1,8 +1,10 @@
+#include "led_blinky_shared.h"
+
 /*
  * Module: RTC + filesystem shell commands.
  * Focus area when checking time validity, mount state, and SD I/O behavior.
  */
-static bool RtcIsLeapYear(uint16_t year)
+bool RtcIsLeapYear(uint16_t year)
 {
     if ((year % 4U) != 0U)
     {
@@ -15,7 +17,7 @@ static bool RtcIsLeapYear(uint16_t year)
     return (year % 400U) == 0U;
 }
 
-static uint64_t RtcReadRawCounter(void)
+uint64_t RtcReadRawCounter(void)
 {
     uint32_t msbA;
     uint32_t lsb;
@@ -33,7 +35,7 @@ static uint64_t RtcReadRawCounter(void)
     return (((uint64_t)msbA << 32U) | (uint64_t)lsb);
 }
 
-static bool RtcEnableCounter(bool enable)
+bool RtcEnableCounter(bool enable)
 {
     uint32_t timeout = RTC_ENABLE_TIMEOUT_LOOPS;
 
@@ -58,7 +60,7 @@ static bool RtcEnableCounter(bool enable)
     return false;
 }
 
-static bool RtcInit(void)
+bool RtcInit(void)
 {
     if (s_rtcInitialized)
     {
@@ -80,7 +82,7 @@ static bool RtcInit(void)
     return true;
 }
 
-static bool RtcIsValid(void)
+bool RtcIsValid(void)
 {
     if (!RtcInit())
     {
@@ -95,7 +97,7 @@ static bool RtcIsValid(void)
     return (SNVS->LPGPR[0] == RTC_VALID_GPR_MAGIC);
 }
 
-static uint32_t RtcGetUnixSeconds(void)
+uint32_t RtcGetUnixSeconds(void)
 {
     uint64_t counter;
 
@@ -108,7 +110,7 @@ static uint32_t RtcGetUnixSeconds(void)
     return (uint32_t)(counter >> RTC_COUNTER_SHIFT);
 }
 
-static bool RtcSetUnixSeconds(uint32_t unixSeconds)
+bool RtcSetUnixSeconds(uint32_t unixSeconds)
 {
     if (!RtcInit())
     {
@@ -133,7 +135,7 @@ static bool RtcSetUnixSeconds(uint32_t unixSeconds)
     return true;
 }
 
-static bool RtcUnixSecondsToDateTime(uint32_t unixSeconds, rtc_datetime_t *dateTime)
+bool RtcUnixSecondsToDateTime(uint32_t unixSeconds, rtc_datetime_t *dateTime)
 {
     static const uint8_t kMonthDays[12] = {31U, 28U, 31U, 30U, 31U, 30U, 31U, 31U, 30U, 31U, 30U, 31U};
     uint32_t days;
@@ -186,7 +188,7 @@ static bool RtcUnixSecondsToDateTime(uint32_t unixSeconds, rtc_datetime_t *dateT
     return true;
 }
 
-static void RtcCommand(int32_t argc, char *argv[])
+void RtcCommand(int32_t argc, char *argv[])
 {
     uint32_t unixSeconds;
     rtc_datetime_t dt;
@@ -266,7 +268,7 @@ DWORD get_fattime(void)
            ((DWORD)dt.hour << 11U) | ((DWORD)dt.minute << 5U) | ((DWORD)(dt.second / 2U));
 }
 
-static const char *FsResultToString(FRESULT result)
+const char *FsResultToString(FRESULT result)
 {
     switch (result)
     {
@@ -315,7 +317,7 @@ static const char *FsResultToString(FRESULT result)
     }
 }
 
-static FRESULT FsMount(void)
+FRESULT FsMount(void)
 {
     FRESULT fr;
 
@@ -345,7 +347,7 @@ static FRESULT FsMount(void)
     return FR_OK;
 }
 
-static FRESULT FsUnmount(void)
+FRESULT FsUnmount(void)
 {
     if (s_canLogFileOpen)
     {
@@ -370,7 +372,7 @@ static FRESULT FsUnmount(void)
     return fr;
 }
 
-static bool FsEnsureMounted(void)
+bool FsEnsureMounted(void)
 {
     if (!s_fsMounted)
     {
@@ -380,7 +382,7 @@ static bool FsEnsureMounted(void)
     return true;
 }
 
-static bool FsParseU32(const char *text, uint32_t *value)
+bool FsParseU32(const char *text, uint32_t *value)
 {
     char *end = NULL;
     unsigned long parsed;
@@ -400,7 +402,7 @@ static bool FsParseU32(const char *text, uint32_t *value)
     return true;
 }
 
-static bool ShellParseU32Auto(const char *text, uint32_t *value)
+bool ShellParseU32Auto(const char *text, uint32_t *value)
 {
     char *end = NULL;
     unsigned long parsed;
@@ -420,7 +422,7 @@ static bool ShellParseU32Auto(const char *text, uint32_t *value)
     return true;
 }
 
-static bool ShellParseCanBus(const char *text, uint32_t *busIndex)
+bool ShellParseCanBus(const char *text, uint32_t *busIndex)
 {
     uint32_t rawBus;
 
@@ -453,7 +455,7 @@ static bool ShellParseCanBus(const char *text, uint32_t *busIndex)
     return true;
 }
 
-static const char *ShellSkipToken(const char *cursor)
+const char *ShellSkipToken(const char *cursor)
 {
     if (cursor == NULL)
     {
@@ -478,7 +480,7 @@ static const char *ShellSkipToken(const char *cursor)
     return cursor;
 }
 
-static void FsCommandList(const char *path)
+void FsCommandList(const char *path)
 {
     FRESULT fr;
     DIR dir;
@@ -532,7 +534,7 @@ static void FsCommandList(const char *path)
     (void)f_closedir(&dir);
 }
 
-static void FsCommandCat(const char *path)
+void FsCommandCat(const char *path)
 {
     FRESULT fr;
     FIL file;
@@ -575,7 +577,7 @@ static void FsCommandCat(const char *path)
     ShellWrite("\r\n");
 }
 
-static void FsCommandWrite(const char *path, const char *payload, bool append)
+void FsCommandWrite(const char *path, const char *payload, bool append)
 {
     FRESULT fr;
     FIL file;
@@ -626,7 +628,7 @@ static void FsCommandWrite(const char *path, const char *payload, bool append)
     ShellWriteLinef("Scritti %lu byte su %s\r\n", (unsigned long)written, path);
 }
 
-static void FsCommandMkDir(const char *path)
+void FsCommandMkDir(const char *path)
 {
     FRESULT fr;
 
@@ -655,7 +657,7 @@ static void FsCommandMkDir(const char *path)
     ShellWriteLinef("mkdir fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
 }
 
-static void FsCommandRemove(const char *path)
+void FsCommandRemove(const char *path)
 {
     FRESULT fr;
 
@@ -679,7 +681,7 @@ static void FsCommandRemove(const char *path)
     ShellWriteLinef("Rimosso: %s\r\n", path);
 }
 
-static void FsCommandMkfs(void)
+void FsCommandMkfs(void)
 {
     FRESULT fr;
     BYTE work[FF_MAX_SS];
@@ -705,7 +707,7 @@ static void FsCommandMkfs(void)
 
 SDK_ALIGN(static uint8_t s_fsBenchBuffer[FS_BENCH_BUFFER_SIZE], 32U);
 
-static void FsCommandBench(uint32_t totalKiB, uint32_t runs)
+void FsCommandBench(uint32_t totalKiB, uint32_t runs)
 {
     FRESULT fr;
     FIL file;
@@ -842,7 +844,7 @@ static void FsCommandBench(uint32_t totalKiB, uint32_t runs)
     }
 }
 
-static void FsCommand(int32_t argc, char *argv[], const char *rawLine)
+void FsCommand(int32_t argc, char *argv[], const char *rawLine)
 {
     if (argc < 2)
     {

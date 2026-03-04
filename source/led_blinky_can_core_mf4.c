@@ -1,8 +1,10 @@
+#include "led_blinky_shared.h"
+
 /*
  * Module: CAN controller low-level primitives + MF4 block writer internals.
  * Focus area when debugging CAN bring-up, TX mailbox recovery, or log file format.
  */
-static status_t CanReleaseStopMode(CAN_Type *base)
+status_t CanReleaseStopMode(CAN_Type *base)
 {
     uint32_t stopReqMask = 0U;
     uint32_t stopAckMask = 0U;
@@ -41,7 +43,7 @@ static status_t CanReleaseStopMode(CAN_Type *base)
     return kStatus_Success;
 }
 
-static status_t CanInitOneWithFlags(can_bus_context_t *bus, uint32_t bitRate, uint32_t modeFlags)
+status_t CanInitOneWithFlags(can_bus_context_t *bus, uint32_t bitRate, uint32_t modeFlags)
 {
     flexcan_config_t config;
     flexcan_rx_mb_config_t rxStdConfig;
@@ -120,7 +122,7 @@ static status_t CanInitOneWithFlags(can_bus_context_t *bus, uint32_t bitRate, ui
     return kStatus_Success;
 }
 
-static status_t CanDeinitOne(can_bus_context_t *bus)
+status_t CanDeinitOne(can_bus_context_t *bus)
 {
     if (bus == NULL)
     {
@@ -139,7 +141,7 @@ static status_t CanDeinitOne(can_bus_context_t *bus)
     return kStatus_Success;
 }
 
-static uint32_t CanEstimateFrameBits(const flexcan_frame_t *frame)
+uint32_t CanEstimateFrameBits(const flexcan_frame_t *frame)
 {
     bool isExtended;
     bool isRemote;
@@ -169,7 +171,7 @@ static uint32_t CanEstimateFrameBits(const flexcan_frame_t *frame)
     return rawBits + ((rawBits + 4U) / 5U);
 }
 
-static void CanUpdateUtilization(TickType_t now)
+void CanUpdateUtilization(TickType_t now)
 {
     TickType_t deltaTicks;
     uint32_t dtMs;
@@ -240,7 +242,7 @@ static void CanUpdateUtilization(TickType_t now)
     }
 }
 
-static void CanResetRuntimeStats(void)
+void CanResetRuntimeStats(void)
 {
     size_t i;
 
@@ -264,7 +266,7 @@ static void CanResetRuntimeStats(void)
     s_canUtilLastTick = xTaskGetTickCount();
 }
 
-static status_t CanWriteTxMbWithRecovery(can_bus_context_t *bus, uint8_t mbIdx, const flexcan_frame_t *frame)
+status_t CanWriteTxMbWithRecovery(can_bus_context_t *bus, uint8_t mbIdx, const flexcan_frame_t *frame)
 {
     status_t status;
 
@@ -284,7 +286,7 @@ static status_t CanWriteTxMbWithRecovery(can_bus_context_t *bus, uint8_t mbIdx, 
     return status;
 }
 
-static status_t CanSendFrame(can_bus_context_t *bus, uint8_t mbIdx, uint32_t id, const uint8_t *payload, uint8_t length)
+status_t CanSendFrame(can_bus_context_t *bus, uint8_t mbIdx, uint32_t id, const uint8_t *payload, uint8_t length)
 {
     flexcan_frame_t frame;
     status_t status;
@@ -331,7 +333,7 @@ static status_t CanSendFrame(can_bus_context_t *bus, uint8_t mbIdx, uint32_t id,
     return status;
 }
 
-static status_t CanSendFrameRaw(can_bus_context_t *bus, uint8_t mbIdx, const flexcan_frame_t *frame)
+status_t CanSendFrameRaw(can_bus_context_t *bus, uint8_t mbIdx, const flexcan_frame_t *frame)
 {
     status_t status;
 
@@ -354,7 +356,7 @@ static status_t CanSendFrameRaw(can_bus_context_t *bus, uint8_t mbIdx, const fle
     return status;
 }
 
-static void CanDumpPrintFrame(size_t busIndex, const flexcan_frame_t *frame, status_t status)
+void CanDumpPrintFrame(size_t busIndex, const flexcan_frame_t *frame, status_t status)
 {
     char line[SHELL_TX_LINE_SIZE];
     uint8_t length;
@@ -423,18 +425,18 @@ static void CanDumpPrintFrame(size_t busIndex, const flexcan_frame_t *frame, sta
     (void)ShellWriteTry(line);
 }
 
-static uint32_t Mf4Align8(uint32_t value)
+uint32_t Mf4Align8(uint32_t value)
 {
     return (value + 7U) & ~7U;
 }
 
-static void Mf4PutU16(uint8_t *dst, uint16_t value)
+void Mf4PutU16(uint8_t *dst, uint16_t value)
 {
     dst[0] = (uint8_t)(value & 0xFFU);
     dst[1] = (uint8_t)((value >> 8U) & 0xFFU);
 }
 
-static void Mf4PutU32(uint8_t *dst, uint32_t value)
+void Mf4PutU32(uint8_t *dst, uint32_t value)
 {
     dst[0] = (uint8_t)(value & 0xFFU);
     dst[1] = (uint8_t)((value >> 8U) & 0xFFU);
@@ -442,7 +444,7 @@ static void Mf4PutU32(uint8_t *dst, uint32_t value)
     dst[3] = (uint8_t)((value >> 24U) & 0xFFU);
 }
 
-static void Mf4PutU64(uint8_t *dst, uint64_t value)
+void Mf4PutU64(uint8_t *dst, uint64_t value)
 {
     dst[0] = (uint8_t)(value & 0xFFU);
     dst[1] = (uint8_t)((value >> 8U) & 0xFFU);
@@ -454,12 +456,12 @@ static void Mf4PutU64(uint8_t *dst, uint64_t value)
     dst[7] = (uint8_t)((value >> 56U) & 0xFFU);
 }
 
-static void Mf4PutS16(uint8_t *dst, int16_t value)
+void Mf4PutS16(uint8_t *dst, int16_t value)
 {
     Mf4PutU16(dst, (uint16_t)value);
 }
 
-static void Mf4PutDouble(uint8_t *dst, double value)
+void Mf4PutDouble(uint8_t *dst, double value)
 {
     union
     {
@@ -470,7 +472,7 @@ static void Mf4PutDouble(uint8_t *dst, double value)
     Mf4PutU64(dst, v.u);
 }
 
-static bool Mf4WriteAt(FIL *file, FSIZE_t offset, const void *data, UINT size)
+bool Mf4WriteAt(FIL *file, FSIZE_t offset, const void *data, UINT size)
 {
     UINT written = 0U;
     FRESULT fr;
@@ -490,7 +492,7 @@ static bool Mf4WriteAt(FIL *file, FSIZE_t offset, const void *data, UINT size)
     return (fr == FR_OK) && (written == size);
 }
 
-static bool Mf4ReadAt(FIL *file, FSIZE_t offset, void *data, UINT size)
+bool Mf4ReadAt(FIL *file, FSIZE_t offset, void *data, UINT size)
 {
     UINT readBytes = 0U;
     FRESULT fr;
@@ -510,12 +512,12 @@ static bool Mf4ReadAt(FIL *file, FSIZE_t offset, void *data, UINT size)
     return (fr == FR_OK) && (readBytes == size);
 }
 
-static uint64_t Mf4UnixSecondsToNano(uint32_t unixSeconds)
+uint64_t Mf4UnixSecondsToNano(uint32_t unixSeconds)
 {
     return ((uint64_t)unixSeconds) * 1000000000ULL;
 }
 
-static void Mf4ComputeLayout(uint32_t *txOffsets, uint32_t *dtBlockOffset, uint32_t *dtDataOffset)
+void Mf4ComputeLayout(uint32_t *txOffsets, uint32_t *dtBlockOffset, uint32_t *dtDataOffset)
 {
     uint32_t cursor = MF4_OFFSET_CN0 + (MF4_CHANNEL_COUNT * MF4_CN_BLOCK_SIZE);
     size_t i;
@@ -536,7 +538,7 @@ static void Mf4ComputeLayout(uint32_t *txOffsets, uint32_t *dtBlockOffset, uint3
     *dtDataOffset = cursor + MF4_BLOCK_COMMON_SIZE;
 }
 
-static bool Mf4WriteTextBlock(FIL *file, uint32_t offset, const char *text)
+bool Mf4WriteTextBlock(FIL *file, uint32_t offset, const char *text)
 {
     uint8_t block[96];
     uint32_t textLen;
@@ -563,7 +565,7 @@ static bool Mf4WriteTextBlock(FIL *file, uint32_t offset, const char *text)
     return Mf4WriteAt(file, offset, block, blockLen);
 }
 
-static bool Mf4WriteFreshFile(FIL *file, mf4_log_state_t *state)
+bool Mf4WriteFreshFile(FIL *file, mf4_log_state_t *state)
 {
     uint8_t block[MF4_CN_BLOCK_SIZE];
     uint8_t idBlock[MF4_ID_BLOCK_SIZE];
@@ -752,7 +754,7 @@ static bool Mf4WriteFreshFile(FIL *file, mf4_log_state_t *state)
     return f_lseek(file, dtDataOffset) == FR_OK;
 }
 
-static bool Mf4PatchCounters(FIL *file, const mf4_log_state_t *state)
+bool Mf4PatchCounters(FIL *file, const mf4_log_state_t *state)
 {
     uint8_t value[8];
     FSIZE_t savedPos;
@@ -779,7 +781,7 @@ static bool Mf4PatchCounters(FIL *file, const mf4_log_state_t *state)
     return f_lseek(file, savedPos) == FR_OK;
 }
 
-static bool Mf4Sync(FIL *file, const mf4_log_state_t *state)
+bool Mf4Sync(FIL *file, const mf4_log_state_t *state)
 {
     if (!Mf4PatchCounters(file, state))
     {
@@ -788,7 +790,7 @@ static bool Mf4Sync(FIL *file, const mf4_log_state_t *state)
     return f_sync(file) == FR_OK;
 }
 
-static bool Mf4RecoverFile(FIL *file, mf4_log_state_t *state)
+bool Mf4RecoverFile(FIL *file, mf4_log_state_t *state)
 {
     uint8_t magic[8];
     uint8_t program[8];
@@ -853,7 +855,7 @@ static bool Mf4RecoverFile(FIL *file, mf4_log_state_t *state)
     return f_lseek(file, state->dtDataOffset + state->dataBytes) == FR_OK;
 }
 
-static bool CanLogEnqueue(size_t busIndex, const flexcan_frame_t *frame, status_t status)
+bool CanLogEnqueue(size_t busIndex, const flexcan_frame_t *frame, status_t status)
 {
     can_log_record_t record;
     BaseType_t sent;
@@ -903,7 +905,7 @@ static bool CanLogEnqueue(size_t busIndex, const flexcan_frame_t *frame, status_
     return sent == pdTRUE;
 }
 
-static void CanHandleRxFrame(size_t busIndex, const flexcan_frame_t *frame, status_t status)
+void CanHandleRxFrame(size_t busIndex, const flexcan_frame_t *frame, status_t status)
 {
     if ((frame == NULL) || (busIndex >= ARRAY_SIZE(s_canBuses)))
     {

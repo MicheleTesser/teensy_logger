@@ -1,3 +1,5 @@
+#include "led_blinky_shared.h"
+
 /*
  * Module: USB callbacks/init sequence + runtime tasks + system entry point.
  * Focus area when endpoints are not primed or shell/gs traffic does not progress.
@@ -5,7 +7,7 @@
 /*******************************************************************************
  * USB callbacks
  ******************************************************************************/
-static usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, void *param)
+usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, void *param)
 {
     usb_status_t error = kStatus_USB_InvalidRequest;
     usb_device_cdc_acm_request_param_struct_t *acmReqParam = (usb_device_cdc_acm_request_param_struct_t *)param;
@@ -179,7 +181,7 @@ static usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t ev
     return error;
 }
 
-static usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *param)
+usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *param)
 {
     usb_status_t error = kStatus_USB_InvalidRequest;
     uint16_t *temp16   = (uint16_t *)param;
@@ -422,7 +424,7 @@ static usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event,
 /*******************************************************************************
  * USB clock/init
  ******************************************************************************/
-static void USB_DeviceClockInit(void)
+void USB_DeviceClockInit(void)
 {
     usb_phy_config_struct_t phyConfig = {
         BOARD_USB_PHY_D_CAL,
@@ -443,7 +445,7 @@ static void USB_DeviceClockInit(void)
     (void)USB_EhciPhyInit(CONTROLLER_ID, BOARD_XTAL0_CLK_HZ, &phyConfig);
 }
 
-static void USB_DeviceIsrEnable(void)
+void USB_DeviceIsrEnable(void)
 {
     uint8_t irqNumber;
     uint8_t usbDeviceEhciIrq[] = USBHS_IRQS;
@@ -453,7 +455,7 @@ static void USB_DeviceIsrEnable(void)
     EnableIRQ((IRQn_Type)irqNumber);
 }
 
-static void USB_DeviceApplicationInit(void)
+void USB_DeviceApplicationInit(void)
 {
     size_t i;
 
@@ -495,7 +497,7 @@ static void USB_DeviceApplicationInit(void)
 /*******************************************************************************
  * App task
  ******************************************************************************/
-static void LedTask(void *pvParameters)
+void LedTask(void *pvParameters)
 {
     led_mode_t appliedMode   = kLedModeBlink;
 
@@ -546,7 +548,7 @@ static void LedTask(void *pvParameters)
     }
 }
 
-static void CanTask(void *pvParameters)
+void CanTask(void *pvParameters)
 {
     uint32_t counter = 0U;
     TickType_t lastHeartbeatTick = xTaskGetTickCount();
@@ -598,7 +600,7 @@ static void CanTask(void *pvParameters)
     }
 }
 
-static void CanLogTask(void *pvParameters)
+void CanLogTask(void *pvParameters)
 {
     TickType_t lastFlushTick = xTaskGetTickCount();
     uint32_t framesSinceSync = 0U;
@@ -695,7 +697,7 @@ static void CanLogTask(void *pvParameters)
     }
 }
 
-static void AppTask(void *pvParameters)
+void AppTask(void *pvParameters)
 {
     uint8_t packet[DATA_BUFF_SIZE];
     uint8_t gsPacket[GS_USB_MAX_PACKET_SIZE];

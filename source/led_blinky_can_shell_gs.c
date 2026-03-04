@@ -1,8 +1,10 @@
+#include "led_blinky_shared.h"
+
 /*
  * Module: CAN runtime/polling + shell command handlers + gs_usb protocol control path.
  * Focus area when host sees only one channel, deferred start/reset, or queue stalls.
  */
-static void CanPollRxMb(can_bus_context_t *bus, size_t busIndex, uint8_t mbIdx)
+void CanPollRxMb(can_bus_context_t *bus, size_t busIndex, uint8_t mbIdx)
 {
     uint64_t mbMask;
     flexcan_frame_t frame;
@@ -27,7 +29,7 @@ static void CanPollRxMb(can_bus_context_t *bus, size_t busIndex, uint8_t mbIdx)
     }
 }
 
-static void CanPollRxDump(void)
+void CanPollRxDump(void)
 {
     size_t i;
 
@@ -43,7 +45,7 @@ static void CanPollRxDump(void)
     }
 }
 
-static status_t CanInitAll(uint32_t bitRate, uint32_t modeFlags)
+status_t CanInitAll(uint32_t bitRate, uint32_t modeFlags)
 {
     size_t i;
     uint32_t canRootHz;
@@ -79,7 +81,7 @@ static status_t CanInitAll(uint32_t bitRate, uint32_t modeFlags)
     return kStatus_Success;
 }
 
-static status_t CanSendFromShell(uint32_t busIndex, uint32_t id, const uint8_t *payload, uint8_t length)
+status_t CanSendFromShell(uint32_t busIndex, uint32_t id, const uint8_t *payload, uint8_t length)
 {
     if ((busIndex == 0U) || (busIndex > ARRAY_SIZE(s_canBuses)) || !s_canReady)
     {
@@ -93,7 +95,7 @@ static status_t CanSendFromShell(uint32_t busIndex, uint32_t id, const uint8_t *
     return CanSendFrame(&s_canBuses[busIndex - 1U], s_canBuses[busIndex - 1U].shellTxMb, id, payload, length);
 }
 
-static void CanCommand(int32_t argc, char *argv[])
+void CanCommand(int32_t argc, char *argv[])
 {
     if (argc < 2)
     {
@@ -264,7 +266,7 @@ static void CanCommand(int32_t argc, char *argv[])
     ShellWrite("Comando can sconosciuto\r\n");
 }
 
-static void ShellPrintHelp(void)
+void ShellPrintHelp(void)
 {
     ShellWrite("Comandi disponibili:\r\n");
     ShellWrite("  help            - mostra questo help\r\n");
@@ -292,7 +294,7 @@ static void ShellPrintHelp(void)
     ShellWrite("  cansend <1|2|can0|can1> <id> [b0..b7]  - alias rapido di can send\r\n");
 }
 
-static void ShellHandleLine(char *line)
+void ShellHandleLine(char *line)
 {
     char rawLine[SHELL_LINE_BUFFER_SIZE];
     char *argv[16];
@@ -436,7 +438,7 @@ static void ShellHandleLine(char *line)
     ShellWrite("Comando sconosciuto\r\n");
 }
 
-static void ShellHandlePacket(const uint8_t *data, uint32_t length)
+void ShellHandlePacket(const uint8_t *data, uint32_t length)
 {
     static char lineBuffer[SHELL_LINE_BUFFER_SIZE];
     static size_t lineLength = 0U;
@@ -487,7 +489,7 @@ static void ShellHandlePacket(const uint8_t *data, uint32_t length)
     }
 }
 
-static void CanRefreshReadyState(void)
+void CanRefreshReadyState(void)
 {
     size_t i;
     bool anyStarted = false;
@@ -503,7 +505,7 @@ static void CanRefreshReadyState(void)
     s_canReady = anyStarted;
 }
 
-static bool CanAnyControllerStarted(void)
+bool CanAnyControllerStarted(void)
 {
     size_t i;
 
@@ -517,7 +519,7 @@ static bool CanAnyControllerStarted(void)
     return false;
 }
 
-static void CanApplyGsClockRoot(void)
+void CanApplyGsClockRoot(void)
 {
     /* CAN1/CAN2 share the same root; never touch it while any controller is running. */
     if (CanAnyControllerStarted())
@@ -528,7 +530,7 @@ static void CanApplyGsClockRoot(void)
     CLOCK_SetDiv(kCLOCK_CanDiv, 2U);
 }
 
-static void GsCanProcessDeferredRequests(void)
+void GsCanProcessDeferredRequests(void)
 {
     size_t channel;
 
@@ -589,7 +591,7 @@ static void GsCanProcessDeferredRequests(void)
     }
 }
 
-static void GsCanHandleBulkOutPacket(const uint8_t *data, uint32_t length)
+void GsCanHandleBulkOutPacket(const uint8_t *data, uint32_t length)
 {
     uint32_t offset = 0U;
 
@@ -656,7 +658,7 @@ static void GsCanHandleBulkOutPacket(const uint8_t *data, uint32_t length)
     }
 }
 
-static bool GsCanHandleVendorRequest(usb_device_control_request_struct_t *controlRequest)
+bool GsCanHandleVendorRequest(usb_device_control_request_struct_t *controlRequest)
 {
     usb_setup_struct_t *setup;
     uint8_t channel;
@@ -856,7 +858,7 @@ static bool GsCanHandleVendorRequest(usb_device_control_request_struct_t *contro
     }
 }
 
-static usb_status_t USB_GsCanBulkOutCallback(usb_device_handle handle,
+usb_status_t USB_GsCanBulkOutCallback(usb_device_handle handle,
                                              usb_device_endpoint_callback_message_struct_t *message,
                                              void *callbackParam)
 {
@@ -871,7 +873,7 @@ static usb_status_t USB_GsCanBulkOutCallback(usb_device_handle handle,
     return kStatus_USB_Success;
 }
 
-static usb_status_t USB_GsCanBulkInCallback(usb_device_handle handle,
+usb_status_t USB_GsCanBulkInCallback(usb_device_handle handle,
                                             usb_device_endpoint_callback_message_struct_t *message,
                                             void *callbackParam)
 {
