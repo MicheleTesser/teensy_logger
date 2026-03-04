@@ -1,4 +1,4 @@
-#include "led_blinky_shared.h"
+#include "app/app_shared.h"
 
 static const CLI_Command_Definition_t s_cliHelpCommand = {
     .pcCommand = "help",
@@ -767,17 +767,14 @@ bool GsCanFillBtConst(uint8_t channel, gs_device_bt_const_t *btConst)
         return false;
     }
 
+    /* Keep advertised CAN clock deterministic before host computes bit timing. */
+    CanApplyGsClockRoot();
     canClock = CLOCK_GetClockRootFreq(kCLOCK_CanClkRoot);
     if (canClock == 0U)
     {
-        /* If CAN root is not configured yet, set it once while all controllers are stopped. */
-        CanApplyGsClockRoot();
-        canClock = CLOCK_GetClockRootFreq(kCLOCK_CanClkRoot);
-        if (canClock == 0U)
-        {
-            canClock = 20000000U;
-        }
+        canClock = 20000000U;
     }
+    s_gsCanBtClockHz = canClock;
 
     btConst->feature  = GsCpuToWire32(GS_CAN_FEATURE_LISTEN_ONLY | GS_CAN_FEATURE_LOOP_BACK);
     btConst->fclkCan  = GsCpuToWire32(canClock);
@@ -809,29 +806,38 @@ uint8_t GsCanDecodeChannelFromSetup(const usb_setup_struct_t *setup)
     indexHi = (uint8_t)((setup->wIndex >> 8U) & 0xFFU);
     indexLo = (uint8_t)(setup->wIndex & 0xFFU);
 
-    /* Most stacks use wValue low byte. */
-    if ((channelLo < GS_USB_CHANNEL_COUNT) &&
-        !((channelLo == 0U) && (channelHi > 0U) && (channelHi < GS_USB_CHANNEL_COUNT)))
+    /* Prefer explicit non-zero channel values first (handles wValue-hi/lo variants). */
+    if ((channelLo < GS_USB_CHANNEL_COUNT) && (channelLo != 0U))
     {
         return channelLo;
     }
-
-    /* Some stacks place channel in wValue high byte (for channel 1: wValue=0x0100). */
-    if (channelHi < GS_USB_CHANNEL_COUNT)
+    if ((channelHi < GS_USB_CHANNEL_COUNT) && (channelHi != 0U))
     {
         return channelHi;
     }
-
-    /* Last resort: channel in wIndex high byte (low byte remains interface number). */
-    if (indexHi < GS_USB_CHANNEL_COUNT)
+    if ((indexHi < GS_USB_CHANNEL_COUNT) && (indexHi != 0U))
     {
         return indexHi;
     }
 
-    /* Compatibility fallback: channel passed directly in wIndex low byte. */
+    /* Linux gs_usb canonical path: channel in wIndex low byte. */
     if (indexLo < GS_USB_CHANNEL_COUNT)
     {
         return indexLo;
+    }
+
+    /* Fallbacks for channel 0 encodings. */
+    if (channelLo < GS_USB_CHANNEL_COUNT)
+    {
+        return channelLo;
+    }
+    if (channelHi < GS_USB_CHANNEL_COUNT)
+    {
+        return channelHi;
+    }
+    if (indexHi < GS_USB_CHANNEL_COUNT)
+    {
+        return indexHi;
     }
 
     return 0xFFU;

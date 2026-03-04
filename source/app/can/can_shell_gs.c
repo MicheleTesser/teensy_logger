@@ -1,4 +1,4 @@
-#include "led_blinky_shared.h"
+#include "app/app_shared.h"
 
 /*
  * Module: CAN runtime/polling + shell command handlers + gs_usb protocol control path.
@@ -40,8 +40,11 @@ void CanPollRxDump(void)
 
     for (i = 0U; i < ARRAY_SIZE(s_canBuses); i++)
     {
+      if (s_canBuses[i].started)
+      {
         CanPollRxMb(&s_canBuses[i], i, s_canBuses[i].rxStdMb);
         CanPollRxMb(&s_canBuses[i], i, s_canBuses[i].rxExtMb);
+      }
     }
 }
 
@@ -798,7 +801,12 @@ bool GsCanHandleVendorRequest(usb_device_control_request_struct_t *controlReques
                         return false;
                     }
 
-                    canClock  = CLOCK_GetClockRootFreq(kCLOCK_CanClkRoot);
+                    /* Convert timing using the same clock advertised via BT_CONST. */
+                    canClock  = s_gsCanBtClockHz;
+                    if (canClock == 0U)
+                    {
+                        canClock = CLOCK_GetClockRootFreq(kCLOCK_CanClkRoot);
+                    }
                     if (canClock == 0U)
                     {
                         canClock = 20000000U;

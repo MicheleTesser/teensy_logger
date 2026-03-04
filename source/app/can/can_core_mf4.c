@@ -1,4 +1,4 @@
-#include "led_blinky_shared.h"
+#include "app/app_shared.h"
 
 /*
  * Module: CAN controller low-level primitives + MF4 block writer internals.

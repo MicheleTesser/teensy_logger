@@ -1,4 +1,4 @@
-#include "led_blinky_shared.h"
+#include "app/app_shared.h"
 
 
 usb_cdc_shell_state_t s_cdcState;
@@ -134,6 +134,7 @@ gs_host_config_t s_gsHostConfig;
 gs_device_bittiming_t s_gsBitTiming;
 gs_device_mode_t s_gsModeRequest;
 uint32_t s_gsBerrRequest;
+volatile uint32_t s_gsCanBtClockHz = 0U;
 gs_device_config_t s_gsDeviceConfig;
 gs_device_bt_const_t s_gsBtConst;
 gs_device_bittiming_t s_gsBitTimingByChannel[GS_USB_CHANNEL_COUNT];

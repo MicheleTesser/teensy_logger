@@ -395,4 +395,5 @@ void BOARD_ConfigMPU(void)
 
     /* Keep D-Cache disabled to avoid USB EHCI DMA cache-coherency issues. */
     SCB_EnableICache();
+    //TODO: enable D cache?
 }

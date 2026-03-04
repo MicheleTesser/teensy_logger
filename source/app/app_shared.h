@@ -1,5 +1,5 @@
-#ifndef LED_BLINKY_SHARED_H
-#define LED_BLINKY_SHARED_H
+#ifndef APP_SHARED_H
+#define APP_SHARED_H
 
 /*
  * FreeRTOS USB CDC shell for Teensy 4.1 (i.MX RT1062):
@@ -549,6 +549,7 @@ extern gs_host_config_t s_gsHostConfig;
 extern gs_device_bittiming_t s_gsBitTiming;
 extern gs_device_mode_t s_gsModeRequest;
 extern uint32_t s_gsBerrRequest;
+extern volatile uint32_t s_gsCanBtClockHz;
 extern gs_device_config_t s_gsDeviceConfig;
 extern gs_device_bt_const_t s_gsBtConst;
 extern gs_device_bittiming_t s_gsBitTimingByChannel[GS_USB_CHANNEL_COUNT];
@@ -556,4 +557,4 @@ extern bool s_gsBitTimingValid[GS_USB_CHANNEL_COUNT];
 
 extern usb_device_class_config_list_struct_t s_cdcAcmConfigList;
 
-#endif /* LED_BLINKY_SHARED_H */
+#endif /* APP_SHARED_H */
