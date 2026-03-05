@@ -21,9 +21,16 @@ static const CLI_Command_Definition_t s_cliCanCommand = {
     .cExpectedNumberOfParameters = -1,
 };
 
+static const CLI_Command_Definition_t s_cliLogCommand = {
+    .pcCommand = "log",
+    .pcHelpString = "log <status|on|off|usb <on|off>|autocan <on|off>>\r\n",
+    .pxCommandInterpreter = ShellCliLogCommand,
+    .cExpectedNumberOfParameters = -1,
+};
+
 static const CLI_Command_Definition_t s_cliSdCommand = {
     .pcCommand = "sd",
-    .pcHelpString = "sd status: spazio SD totale/libero/usato\r\n",
+    .pcHelpString = "sd <status|refresh>: stato spazio SD (cache)\r\n",
     .pxCommandInterpreter = ShellCliSdCommand,
     .cExpectedNumberOfParameters = -1,
 };
@@ -32,6 +39,13 @@ static const CLI_Command_Definition_t s_cliRtcCommand = {
     .pcCommand = "rtc",
     .pcHelpString = "rtc <status|set <unix_epoch>>\r\n",
     .pxCommandInterpreter = ShellCliRtcCommand,
+    .cExpectedNumberOfParameters = -1,
+};
+
+static const CLI_Command_Definition_t s_cliTimeCommand = {
+    .pcCommand = "time",
+    .pcHelpString = "time [<unix_epoch>|status|set <unix_epoch>]\r\n",
+    .pxCommandInterpreter = ShellCliTimeCommand,
     .cExpectedNumberOfParameters = -1,
 };
 
@@ -244,11 +258,19 @@ void ShellCliInit(void)
     {
         return;
     }
+    if (FreeRTOS_CLIRegisterCommand(&s_cliLogCommand) != pdTRUE)
+    {
+        return;
+    }
     if (FreeRTOS_CLIRegisterCommand(&s_cliSdCommand) != pdTRUE)
     {
         return;
     }
     if (FreeRTOS_CLIRegisterCommand(&s_cliRtcCommand) != pdTRUE)
+    {
+        return;
+    }
+    if (FreeRTOS_CLIRegisterCommand(&s_cliTimeCommand) != pdTRUE)
     {
         return;
     }
@@ -264,9 +286,11 @@ BaseType_t ShellCliHelpCommand(char *pcWriteBuffer, size_t xWriteBufferLen, cons
                    "  help                 - mostra questo help\r\n"
                    "  led <status|activity|on|off>\r\n"
                    "  can <status|util|clear>\r\n"
-                   "  sd status            - spazio SD totale/libero/usato\r\n"
+                   "  log <status|on|off|usb <on|off>|autocan <on|off>>\r\n"
+                   "  sd <status|refresh>  - spazio SD totale/libero/usato\r\n"
                    "  rtc status           - stato RTC SNVS (UTC)\r\n"
                    "  rtc set <epoch>      - imposta RTC con Unix epoch\r\n"
+                   "  time [epoch]          - alias rapido per leggere/impostare RTC\r\n"
                    "Nota: CAN init/send solo via SocketCAN.\r\n");
     return pdFALSE;
 }
@@ -392,23 +416,117 @@ BaseType_t ShellCliCanCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const
     return pdFALSE;
 }
 
+BaseType_t ShellCliLogCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
+{
+    const char *subcmd;
+    BaseType_t subcmdLen = 0;
+
+    subcmd = FreeRTOS_CLIGetParameter(pcCommandString, 1U, &subcmdLen);
+    if ((subcmd == NULL) || ShellTokenEquals(subcmd, subcmdLen, "status"))
+    {
+        bool usbAttached = (s_cdcState.attach == 1U);
+        bool active = s_logEnabled && (s_logAllowWhenUsbAttached || !usbAttached);
+        (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                       "log enabled=%u active=%u usb_attached=%u allow_usb=%u autocan=%u file=%s\r\n",
+                       s_logEnabled ? 1U : 0U, active ? 1U : 0U, usbAttached ? 1U : 0U,
+                       s_logAllowWhenUsbAttached ? 1U : 0U, s_canAutoStartEnabled ? 1U : 0U,
+                       (s_canLogFileOpen && (s_canLogActivePath[0] != '\0')) ? s_canLogActivePath : "(n/a)");
+        return pdFALSE;
+    }
+
+    if (ShellTokenEquals(subcmd, subcmdLen, "on"))
+    {
+        s_logEnabled = true;
+        (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Logging ON\r\n");
+        return pdFALSE;
+    }
+
+    if (ShellTokenEquals(subcmd, subcmdLen, "off"))
+    {
+        s_logEnabled = false;
+        (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Logging OFF\r\n");
+        return pdFALSE;
+    }
+
+    if (ShellTokenEquals(subcmd, subcmdLen, "usb"))
+    {
+        const char *arg;
+        BaseType_t argLen = 0;
+        arg = FreeRTOS_CLIGetParameter(pcCommandString, 2U, &argLen);
+        if ((arg == NULL) || (argLen <= 0))
+        {
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: log usb <on|off>\r\n");
+            return pdFALSE;
+        }
+        if (ShellTokenEquals(arg, argLen, "on"))
+        {
+            s_logAllowWhenUsbAttached = true;
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Logging con USB collegato: ON\r\n");
+            return pdFALSE;
+        }
+        if (ShellTokenEquals(arg, argLen, "off"))
+        {
+            s_logAllowWhenUsbAttached = false;
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Logging con USB collegato: OFF\r\n");
+            return pdFALSE;
+        }
+        (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: log usb <on|off>\r\n");
+        return pdFALSE;
+    }
+
+    if (ShellTokenEquals(subcmd, subcmdLen, "autocan"))
+    {
+        const char *arg;
+        BaseType_t argLen = 0;
+        arg = FreeRTOS_CLIGetParameter(pcCommandString, 2U, &argLen);
+        if ((arg == NULL) || (argLen <= 0))
+        {
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: log autocan <on|off>\r\n");
+            return pdFALSE;
+        }
+        if (ShellTokenEquals(arg, argLen, "on"))
+        {
+            s_canAutoStartEnabled = true;
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Auto CAN start: ON\r\n");
+            return pdFALSE;
+        }
+        if (ShellTokenEquals(arg, argLen, "off"))
+        {
+            s_canAutoStartEnabled = false;
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Auto CAN start: OFF\r\n");
+            return pdFALSE;
+        }
+        (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: log autocan <on|off>\r\n");
+        return pdFALSE;
+    }
+
+    (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: log <status|on|off|usb <on|off>|autocan <on|off>>\r\n");
+    return pdFALSE;
+}
+
 BaseType_t ShellCliSdCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
 {
     const char *subcmd;
     BaseType_t subcmdLen = 0;
-    FATFS *fs = NULL;
-    DWORD freeClusters = 0U;
+    bool forceRefresh = false;
+    sd_usage_cache_t usage;
+    TickType_t now;
+    uint32_t ageMs = 0U;
     FRESULT fr;
-    uint64_t totalBytes;
-    uint64_t freeBytes;
-    uint64_t usedBytes;
-    uint32_t usedPermille = 0U;
+    bool hasSnapshot;
 
     subcmd = FreeRTOS_CLIGetParameter(pcCommandString, 1U, &subcmdLen);
-    if ((subcmd != NULL) && !ShellTokenEquals(subcmd, subcmdLen, "status"))
+    if (subcmd != NULL)
     {
-        (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: sd status\r\n");
-        return pdFALSE;
+        if (ShellTokenEquals(subcmd, subcmdLen, "refresh"))
+        {
+            forceRefresh = true;
+        }
+        else if (!ShellTokenEquals(subcmd, subcmdLen, "status"))
+        {
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: sd <status|refresh>\r\n");
+            return pdFALSE;
+        }
     }
 
     if (!s_fsMounted)
@@ -419,40 +537,57 @@ BaseType_t ShellCliSdCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const 
             (void)snprintf(pcWriteBuffer, xWriteBufferLen, "SD non montata: %s (%d)\r\n", FsResultToString(fr), (int)fr);
             return pdFALSE;
         }
+        forceRefresh = true;
     }
 
-    fr = f_getfree(s_fsDrive, &freeClusters, &fs);
-    if ((fr != FR_OK) || (fs == NULL))
+    hasSnapshot = SdUsageSnapshot(&usage);
+    if (forceRefresh || !hasSnapshot)
+    {
+        fr = SdUsageRefresh(true);
+    }
+    else
+    {
+        fr = FR_OK;
+    }
+
+    if ((fr != FR_OK) && !hasSnapshot)
     {
         (void)snprintf(pcWriteBuffer, xWriteBufferLen, "sd status fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
         return pdFALSE;
     }
 
-    totalBytes = ((uint64_t)(fs->n_fatent - 2U) * (uint64_t)fs->csize * (uint64_t)FF_MAX_SS);
-    freeBytes = ((uint64_t)freeClusters * (uint64_t)fs->csize * (uint64_t)FF_MAX_SS);
-    if (freeBytes > totalBytes)
+    if (fr == FR_OK)
     {
-        freeBytes = totalBytes;
+        hasSnapshot = SdUsageSnapshot(&usage);
     }
-    usedBytes = totalBytes - freeBytes;
-    if (totalBytes > 0ULL)
+    if (!hasSnapshot)
     {
-        usedPermille = (uint32_t)((usedBytes * 1000ULL) / totalBytes);
+        (void)snprintf(pcWriteBuffer, xWriteBufferLen, "SD cache non disponibile\r\n");
+        return pdFALSE;
     }
 
+    now = xTaskGetTickCount();
+    ageMs = (uint32_t)((now - usage.tick) * portTICK_PERIOD_MS);
+
     (void)snprintf(pcWriteBuffer, xWriteBufferLen,
-                   "SD totale=%llu MiB libero=%llu MiB usato=%llu MiB (%u.%u%%)\r\n",
-                   (unsigned long long)(totalBytes / (1024ULL * 1024ULL)),
-                   (unsigned long long)(freeBytes / (1024ULL * 1024ULL)),
-                   (unsigned long long)(usedBytes / (1024ULL * 1024ULL)),
-                   (unsigned int)(usedPermille / 10U), (unsigned int)(usedPermille % 10U));
+                   "SD totale=%llu MiB libero=%llu MiB usato=%llu MiB (%u.%u%%) cache_age=%lu ms\r\n"
+                   "log=%s\r\n",
+                   (unsigned long long)(usage.totalBytes / (1024ULL * 1024ULL)),
+                   (unsigned long long)(usage.freeBytes / (1024ULL * 1024ULL)),
+                   (unsigned long long)(usage.usedBytes / (1024ULL * 1024ULL)),
+                   (unsigned int)(usage.usedPermille / 10U), (unsigned int)(usage.usedPermille % 10U),
+                   (unsigned long)ageMs,
+                   (s_canLogFileOpen && (s_canLogActivePath[0] != '\0')) ? s_canLogActivePath : "(n/a)");
     return pdFALSE;
 }
 
 BaseType_t ShellCliRtcCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
 {
     const char *subcmd;
+    const char *param = NULL;
     BaseType_t subcmdLen = 0;
+    BaseType_t paramLen = 0;
+    char token[24];
     uint32_t unixSeconds;
     rtc_datetime_t dt;
 
@@ -471,10 +606,6 @@ BaseType_t ShellCliRtcCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const
 
     if (ShellTokenEquals(subcmd, subcmdLen, "set"))
     {
-        const char *param = NULL;
-        BaseType_t paramLen = 0;
-        char token[24];
-
         param = FreeRTOS_CLIGetParameter(pcCommandString, 2U, &paramLen);
         if ((param == NULL) || (paramLen <= 0) || ((size_t)paramLen >= sizeof(token)))
         {
@@ -503,7 +634,94 @@ BaseType_t ShellCliRtcCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const
         return pdFALSE;
     }
 
+    /* Shorthand: rtc <unix_epoch> */
+    if ((subcmdLen > 0) && ((size_t)subcmdLen < sizeof(token)))
+    {
+        (void)memcpy(token, subcmd, (size_t)subcmdLen);
+        token[subcmdLen] = '\0';
+        if (ShellParseU32Auto(token, &unixSeconds))
+        {
+            if (!RtcSetUnixSeconds(unixSeconds))
+            {
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Errore impostazione RTC\r\n");
+                return pdFALSE;
+            }
+
+            (void)RtcUnixSecondsToDateTime(unixSeconds, &dt);
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "RTC impostato: %lu (%04u-%02u-%02u %02u:%02u:%02u UTC)\r\n",
+                           (unsigned long)unixSeconds, (unsigned int)dt.year, (unsigned int)dt.month,
+                           (unsigned int)dt.day, (unsigned int)dt.hour, (unsigned int)dt.minute,
+                           (unsigned int)dt.second);
+            return pdFALSE;
+        }
+    }
+
     (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: rtc <status|set <unix_epoch>>\r\n");
+    return pdFALSE;
+}
+
+BaseType_t ShellCliTimeCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
+{
+    const char *subcmd;
+    BaseType_t subcmdLen = 0;
+    uint32_t unixSeconds;
+    rtc_datetime_t dt;
+    char token[24];
+
+    subcmd = FreeRTOS_CLIGetParameter(pcCommandString, 1U, &subcmdLen);
+    if ((subcmd == NULL) || ShellTokenEquals(subcmd, subcmdLen, "status"))
+    {
+        unixSeconds = RtcGetUnixSeconds();
+        (void)RtcUnixSecondsToDateTime(unixSeconds, &dt);
+        (void)snprintf(pcWriteBuffer, xWriteBufferLen, "epoch=%lu UTC=%04u-%02u-%02u %02u:%02u:%02u valid=%u\r\n",
+                       (unsigned long)unixSeconds, (unsigned int)dt.year, (unsigned int)dt.month,
+                       (unsigned int)dt.day, (unsigned int)dt.hour, (unsigned int)dt.minute, (unsigned int)dt.second,
+                       RtcIsValid() ? 1U : 0U);
+        return pdFALSE;
+    }
+
+    if (ShellTokenEquals(subcmd, subcmdLen, "set"))
+    {
+        const char *param = NULL;
+        BaseType_t paramLen = 0;
+
+        param = FreeRTOS_CLIGetParameter(pcCommandString, 2U, &paramLen);
+        if ((param == NULL) || (paramLen <= 0) || ((size_t)paramLen >= sizeof(token)))
+        {
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: time [<unix_epoch>|status|set <unix_epoch>]\r\n");
+            return pdFALSE;
+        }
+
+        (void)memcpy(token, param, (size_t)paramLen);
+        token[paramLen] = '\0';
+    }
+    else
+    {
+        if ((subcmdLen <= 0) || ((size_t)subcmdLen >= sizeof(token)))
+        {
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: time [<unix_epoch>|status|set <unix_epoch>]\r\n");
+            return pdFALSE;
+        }
+        (void)memcpy(token, subcmd, (size_t)subcmdLen);
+        token[subcmdLen] = '\0';
+    }
+
+    if (!ShellParseU32Auto(token, &unixSeconds))
+    {
+        (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Epoch non valido\r\n");
+        return pdFALSE;
+    }
+
+    if (!RtcSetUnixSeconds(unixSeconds))
+    {
+        (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Errore impostazione RTC\r\n");
+        return pdFALSE;
+    }
+
+    (void)RtcUnixSecondsToDateTime(unixSeconds, &dt);
+    (void)snprintf(pcWriteBuffer, xWriteBufferLen, "RTC impostato: %lu (%04u-%02u-%02u %02u:%02u:%02u UTC)\r\n",
+                   (unsigned long)unixSeconds, (unsigned int)dt.year, (unsigned int)dt.month, (unsigned int)dt.day,
+                   (unsigned int)dt.hour, (unsigned int)dt.minute, (unsigned int)dt.second);
     return pdFALSE;
 }
 

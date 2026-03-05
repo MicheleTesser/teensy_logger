@@ -13,6 +13,7 @@ int main(void)
 
     USER_LED_INIT(LOGIC_LED_OFF);
     (void)RtcInit();
+    (void)RtcAutoSetFromBuildIfInvalid();
     ShellCliInit();
 
     s_canLogQueue = xQueueCreate(CAN_LOG_QUEUE_LENGTH, sizeof(can_log_record_t));

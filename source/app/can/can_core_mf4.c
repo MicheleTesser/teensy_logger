@@ -855,6 +855,230 @@ bool Mf4RecoverFile(FIL *file, mf4_log_state_t *state)
     return f_lseek(file, state->dtDataOffset + state->dataBytes) == FR_OK;
 }
 
+static bool CanLogBuildSequentialPath(char *path, size_t pathSize)
+{
+    DIR dir;
+    FILINFO info;
+    FRESULT fr;
+    uint32_t maxIdx = 0U;
+    bool foundAny = false;
+
+    if ((path == NULL) || (pathSize == 0U))
+    {
+        return false;
+    }
+
+    fr = f_opendir(&dir, "/");
+    if (fr != FR_OK)
+    {
+        return false;
+    }
+
+    while (true)
+    {
+        const char *name;
+        const char *dot;
+        const char *p;
+        uint32_t idx = 0U;
+        bool hasDigit = false;
+
+        fr = f_readdir(&dir, &info);
+        if (fr != FR_OK)
+        {
+            (void)f_closedir(&dir);
+            return false;
+        }
+        if (info.fname[0] == '\0')
+        {
+            break;
+        }
+        if ((info.fattrib & AM_DIR) != 0U)
+        {
+            continue;
+        }
+
+        name = info.fname;
+        if ((strncmp(name, "LOG", 3U) != 0) && (strncmp(name, "log", 3U) != 0))
+        {
+            continue;
+        }
+        dot = strrchr(name, '.');
+        if ((dot == NULL) || ((strcmp(dot, ".MF4") != 0) && (strcmp(dot, ".mf4") != 0)))
+        {
+            continue;
+        }
+        p = name + 3U;
+        while (p < dot)
+        {
+            if ((*p < '0') || (*p > '9'))
+            {
+                idx = CAN_LOG_MAX_SEQ_INDEX;
+                break;
+            }
+            hasDigit = true;
+            idx = (idx * 10U) + (uint32_t)(*p - '0');
+            p++;
+        }
+        if (!hasDigit || (idx >= (CAN_LOG_MAX_SEQ_INDEX - 1U)))
+        {
+            continue;
+        }
+        if (!foundAny || (idx > maxIdx))
+        {
+            maxIdx = idx;
+            foundAny = true;
+        }
+    }
+
+    (void)f_closedir(&dir);
+
+    if (foundAny)
+    {
+        s_canLogNextIndex = maxIdx + 1U;
+    }
+    else if (s_canLogNextIndex == 0U)
+    {
+        s_canLogNextIndex = 0U;
+    }
+
+    if (s_canLogNextIndex >= CAN_LOG_MAX_SEQ_INDEX)
+    {
+        return false;
+    }
+
+    {
+        int32_t n = snprintf(path, pathSize, "/log%lu.mf4", (unsigned long)s_canLogNextIndex);
+        if ((n <= 0) || ((size_t)n >= pathSize))
+        {
+            return false;
+        }
+    }
+
+    s_canLogNextIndex++;
+    return true;
+}
+
+static bool CanLogBuildRtcPath(char *path, size_t pathSize)
+{
+    rtc_datetime_t dt;
+    char dirPath[12];
+    uint16_t year2;
+    uint32_t suffix;
+    int32_t n;
+    FRESULT fr;
+    FILINFO info;
+
+    if ((path == NULL) || (pathSize == 0U))
+    {
+        return false;
+    }
+    if (!RtcIsValid())
+    {
+        return false;
+    }
+
+    if (!RtcUnixSecondsToDateTime(RtcGetUnixSeconds(), &dt))
+    {
+        return false;
+    }
+
+    year2 = (uint16_t)(dt.year % 100U);
+    n = snprintf(dirPath, sizeof(dirPath), "/%02u%02u%02u", (unsigned int)year2, (unsigned int)dt.month,
+                 (unsigned int)dt.day);
+    if ((n <= 0) || ((size_t)n >= sizeof(dirPath)))
+    {
+        return false;
+    }
+
+    fr = f_mkdir(dirPath);
+    if ((fr != FR_OK) && (fr != FR_EXIST))
+    {
+        return false;
+    }
+
+    for (suffix = 0U; suffix < 100U; suffix++)
+    {
+        n = snprintf(path, pathSize, "%s/%02u%02u%02u%02u.MF4", dirPath, (unsigned int)dt.hour,
+                     (unsigned int)dt.minute, (unsigned int)dt.second, (unsigned int)suffix);
+        if ((n <= 0) || ((size_t)n >= pathSize))
+        {
+            return false;
+        }
+
+        fr = f_stat(path, &info);
+        if ((fr == FR_NO_FILE) || (fr == FR_NO_PATH))
+        {
+            return true;
+        }
+        if (fr != FR_OK)
+        {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+static bool CanLogBuildNextPath(char *path, size_t pathSize)
+{
+    if ((path == NULL) || (pathSize == 0U))
+    {
+        return false;
+    }
+
+    if (CanLogBuildRtcPath(path, pathSize))
+    {
+        return true;
+    }
+
+    return CanLogBuildSequentialPath(path, pathSize);
+}
+
+bool CanLogOpenFile(FIL *file, mf4_log_state_t *state)
+{
+    char path[CAN_LOG_PATH_MAX];
+    FRESULT fr = FR_INT_ERR;
+    uint32_t attempt;
+
+    if ((file == NULL) || (state == NULL))
+    {
+        return false;
+    }
+
+    for (attempt = 0U; attempt < 16U; attempt++)
+    {
+        if (!CanLogBuildNextPath(path, sizeof(path)))
+        {
+            return false;
+        }
+
+        fr = f_open(file, path, FA_CREATE_NEW | FA_WRITE | FA_READ);
+        if (fr == FR_OK)
+        {
+            break;
+        }
+        if (fr != FR_EXIST)
+        {
+            return false;
+        }
+    }
+    if (fr != FR_OK)
+    {
+        return false;
+    }
+
+    if (!Mf4WriteFreshFile(file, state))
+    {
+        (void)f_close(file);
+        (void)f_unlink(path);
+        return false;
+    }
+
+    (void)strncpy(s_canLogActivePath, path, sizeof(s_canLogActivePath) - 1U);
+    s_canLogActivePath[sizeof(s_canLogActivePath) - 1U] = '\0';
+    return true;
+}
+
 bool CanLogEnqueue(size_t busIndex, const flexcan_frame_t *frame, status_t status)
 {
     can_log_record_t record;

@@ -393,7 +393,10 @@ void BOARD_ConfigMPU(void)
     /* Enable MPU */
     ARM_MPU_Enable(MPU_CTRL_PRIVDEFENA_Msk);
 
-    /* Keep D-Cache disabled to avoid USB EHCI DMA cache-coherency issues. */
+    /*
+     * Keep D-Cache disabled for now: USB DMA buffers are currently allocated in cacheable SRAM
+     * (no dedicated NonCacheable linker section yet), and enabling D-Cache breaks USB CDC/gs_usb
+     * enumeration/data coherency.
+     */
     SCB_EnableICache();
-    //TODO: enable D cache?
 }

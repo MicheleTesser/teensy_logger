@@ -59,12 +59,19 @@ void CanTask(void *pvParameters)
 {
     uint32_t counter = 0U;
     TickType_t lastHeartbeatTick = xTaskGetTickCount();
+    TickType_t lastAutoStartAttemptTick = xTaskGetTickCount() - pdMS_TO_TICKS(CAN_AUTOSTART_RETRY_MS);
 
     (void)pvParameters;
 
     for (;;)
     {
         TickType_t now = xTaskGetTickCount();
+        if (s_canAutoStartEnabled && !s_gsCanConfigured && !s_canReady &&
+            ((now - lastAutoStartAttemptTick) >= pdMS_TO_TICKS(CAN_AUTOSTART_RETRY_MS)))
+        {
+            (void)CanInitAll(s_canBitRate, 0U);
+            lastAutoStartAttemptTick = now;
+        }
 
         if (s_canReady && s_canHeartbeatEnabled &&
             ((now - lastHeartbeatTick) >= pdMS_TO_TICKS(CAN_HEARTBEAT_PERIOD_MS)))
@@ -110,13 +117,46 @@ void CanTask(void *pvParameters)
 void CanLogTask(void *pvParameters)
 {
     TickType_t lastFlushTick = xTaskGetTickCount();
+    TickType_t lastUsageRefreshTick = xTaskGetTickCount();
     uint32_t framesSinceSync = 0U;
+    bool loggingPaused = false;
     can_log_record_t record;
 
     (void)pvParameters;
 
     for (;;)
     {
+        bool usbAttached = (s_cdcState.attach == 1U);
+        bool loggingAllowed = s_logEnabled && (s_logAllowWhenUsbAttached || !usbAttached);
+
+        if (!loggingAllowed)
+        {
+            if (s_canLogFileOpen)
+            {
+                if (s_mf4LogState.ready)
+                {
+                    (void)Mf4Sync(&s_canLogFile, &s_mf4LogState);
+                }
+                else
+                {
+                    (void)f_sync(&s_canLogFile);
+                }
+                (void)f_close(&s_canLogFile);
+                s_canLogFileOpen = false;
+                s_canLogActivePath[0] = '\0';
+                s_mf4LogState.ready = false;
+            }
+
+            if (!loggingPaused && (s_canLogQueue != NULL))
+            {
+                (void)xQueueReset(s_canLogQueue);
+            }
+            loggingPaused = true;
+            vTaskDelay(pdMS_TO_TICKS(50U));
+            continue;
+        }
+        loggingPaused = false;
+
         if (!s_fsMounted)
         {
             if (FsMount() != FR_OK)
@@ -128,26 +168,17 @@ void CanLogTask(void *pvParameters)
 
         if (!s_canLogFileOpen)
         {
-            FRESULT fr = f_open(&s_canLogFile, CAN_LOG_PATH, FA_OPEN_ALWAYS | FA_WRITE | FA_READ);
-            if (fr != FR_OK)
+            if (!CanLogOpenFile(&s_canLogFile, &s_mf4LogState))
             {
+                SdUsageInvalidate();
                 vTaskDelay(pdMS_TO_TICKS(CAN_LOG_MOUNT_RETRY_MS));
                 continue;
             }
             s_canLogFileOpen = true;
             lastFlushTick    = xTaskGetTickCount();
+            lastUsageRefreshTick = lastFlushTick;
             framesSinceSync  = 0U;
-
-            if (!Mf4RecoverFile(&s_canLogFile, &s_mf4LogState))
-            {
-                (void)f_close(&s_canLogFile);
-                s_canLogFileOpen = false;
-                s_mf4LogState.ready = false;
-                s_fsMounted      = false;
-                (void)f_mount(NULL, s_fsDrive, 0U);
-                vTaskDelay(pdMS_TO_TICKS(CAN_LOG_MOUNT_RETRY_MS));
-                continue;
-            }
+            SdUsageInvalidate();
         }
 
         if (xQueueReceive(s_canLogQueue, &record, pdMS_TO_TICKS(50U)) == pdTRUE)
@@ -158,9 +189,11 @@ void CanLogTask(void *pvParameters)
             {
                 (void)f_close(&s_canLogFile);
                 s_canLogFileOpen = false;
+                s_canLogActivePath[0] = '\0';
                 s_mf4LogState.ready = false;
                 s_fsMounted      = false;
                 (void)f_mount(NULL, s_fsDrive, 0U);
+                SdUsageInvalidate();
                 vTaskDelay(pdMS_TO_TICKS(CAN_LOG_MOUNT_RETRY_MS));
                 continue;
             }
@@ -174,9 +207,11 @@ void CanLogTask(void *pvParameters)
                 {
                     (void)f_close(&s_canLogFile);
                     s_canLogFileOpen = false;
+                    s_canLogActivePath[0] = '\0';
                     s_mf4LogState.ready = false;
                     s_fsMounted      = false;
                     (void)f_mount(NULL, s_fsDrive, 0U);
+                    SdUsageInvalidate();
                     vTaskDelay(pdMS_TO_TICKS(CAN_LOG_MOUNT_RETRY_MS));
                     continue;
                 }
@@ -192,14 +227,23 @@ void CanLogTask(void *pvParameters)
             {
                 (void)f_close(&s_canLogFile);
                 s_canLogFileOpen = false;
+                s_canLogActivePath[0] = '\0';
                 s_mf4LogState.ready = false;
                 s_fsMounted      = false;
                 (void)f_mount(NULL, s_fsDrive, 0U);
+                SdUsageInvalidate();
                 vTaskDelay(pdMS_TO_TICKS(CAN_LOG_MOUNT_RETRY_MS));
                 continue;
             }
             lastFlushTick  = xTaskGetTickCount();
             framesSinceSync = 0U;
+        }
+
+        if (s_fsMounted &&
+            ((xTaskGetTickCount() - lastUsageRefreshTick) >= pdMS_TO_TICKS(SD_USAGE_CACHE_TTL_MS)))
+        {
+            (void)SdUsageRefresh(false);
+            lastUsageRefreshTick = xTaskGetTickCount();
         }
     }
 }
@@ -214,6 +258,8 @@ void AppTask(void *pvParameters)
 
     for (;;)
     {
+        bool didWork = false;
+
         if (s_gsCanConfigured)
         {
             GsCanProcessDeferredRequests();
@@ -232,6 +278,7 @@ void AppTask(void *pvParameters)
                 (void)memcpy(gsPacket, s_gsCanOutBuffer, gsSize);
                 s_gsCanOutSize = 0U;
                 GsCanHandleBulkOutPacket(gsPacket, gsSize);
+                didWork = true;
 
                 if (USB_DeviceRecvRequest(s_cdcState.deviceHandle, (uint8_t)(USB_GS_CAN_BULK_OUT_ENDPOINT | (USB_OUT << 7U)),
                                           s_gsCanOutBuffer, g_UsbDeviceGsCanEndpoints[1].maxPacketSize) ==
@@ -247,10 +294,15 @@ void AppTask(void *pvParameters)
                     kStatus_USB_Success)
                 {
                     s_gsCanOutPrimed = true;
+                    didWork = true;
                 }
             }
 
             GsCanTrySendNext();
+            if (s_gsCanTxCount != 0U)
+            {
+                didWork = true;
+            }
         }
 
         if (s_cdcState.attach == 1U)
@@ -289,6 +341,7 @@ void AppTask(void *pvParameters)
                 s_cdcOutPrimed = false;
 
                 ShellHandlePacket(packet, rxSize);
+                didWork = true;
 
                 if (USB_DeviceCdcAcmRecv(
                         s_cdcState.cdcAcmHandle, USB_CDC_VCOM_BULK_OUT_ENDPOINT, s_recvBuffer,
@@ -307,6 +360,11 @@ void AppTask(void *pvParameters)
             s_shellSessionReady = 0U;
             s_cdcOutPrimed = false;
             vTaskDelay(pdMS_TO_TICKS(2U));
+        }
+
+        if (didWork)
+        {
+            taskYIELD();
         }
     }
 }

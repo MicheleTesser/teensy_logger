@@ -1,4 +1,9 @@
 #include "app/app_shared.h"
+#include "build_epoch.h"
+
+#ifndef APP_BUILD_UNIX_EPOCH
+#define APP_BUILD_UNIX_EPOCH 0UL
+#endif
 
 /*
  * Module: RTC + filesystem shell commands.
@@ -133,6 +138,24 @@ bool RtcSetUnixSeconds(uint32_t unixSeconds)
     SNVS->LPGPR[0] = RTC_VALID_GPR_MAGIC;
     SNVS->LPGPR[1] = unixSeconds;
     return true;
+}
+
+bool RtcAutoSetFromBuildIfInvalid(void)
+{
+    uint32_t buildEpoch = (uint32_t)APP_BUILD_UNIX_EPOCH;
+
+    if (RtcIsValid())
+    {
+        return true;
+    }
+
+    /* Sanity guard: reject invalid/old generated timestamps. */
+    if (buildEpoch < 1577836800UL) /* 2020-01-01 00:00:00 UTC */
+    {
+        return false;
+    }
+
+    return RtcSetUnixSeconds(buildEpoch);
 }
 
 bool RtcUnixSecondsToDateTime(uint32_t unixSeconds, rtc_datetime_t *dateTime)
@@ -331,6 +354,7 @@ FRESULT FsMount(void)
     if (fr != FR_OK)
     {
         s_fsMounted = false;
+        SdUsageInvalidate();
         return fr;
     }
 
@@ -339,11 +363,13 @@ FRESULT FsMount(void)
     if (fr != FR_OK)
     {
         s_fsMounted = false;
+        SdUsageInvalidate();
         return fr;
     }
 #endif
 
     s_fsMounted = true;
+    SdUsageInvalidate();
     return FR_OK;
 }
 
@@ -361,6 +387,7 @@ FRESULT FsUnmount(void)
         }
         (void)f_close(&s_canLogFile);
         s_canLogFileOpen = false;
+        s_canLogActivePath[0] = '\0';
     }
     s_mf4LogState.ready = false;
 
@@ -369,6 +396,7 @@ FRESULT FsUnmount(void)
     {
         s_fsMounted = false;
     }
+    SdUsageInvalidate();
     return fr;
 }
 
@@ -380,6 +408,100 @@ bool FsEnsureMounted(void)
         return false;
     }
     return true;
+}
+
+void SdUsageInvalidate(void)
+{
+    taskENTER_CRITICAL();
+    s_sdUsageCache.valid = false;
+    s_sdUsageCache.tick = xTaskGetTickCount();
+    s_sdUsageCache.lastResult = s_fsMounted ? FR_INT_ERR : FR_NOT_READY;
+    taskEXIT_CRITICAL();
+}
+
+FRESULT SdUsageRefresh(bool force)
+{
+    FATFS *fs = NULL;
+    DWORD freeClusters = 0U;
+    FRESULT fr;
+    sd_usage_cache_t updated;
+    TickType_t now = xTaskGetTickCount();
+
+    if (!s_fsMounted)
+    {
+        taskENTER_CRITICAL();
+        s_sdUsageCache.valid = false;
+        s_sdUsageCache.tick = now;
+        s_sdUsageCache.lastResult = FR_NOT_READY;
+        taskEXIT_CRITICAL();
+        return FR_NOT_READY;
+    }
+
+    if (!force)
+    {
+        bool cachedValid;
+        TickType_t cachedTick;
+
+        taskENTER_CRITICAL();
+        cachedValid = s_sdUsageCache.valid;
+        cachedTick = s_sdUsageCache.tick;
+        taskEXIT_CRITICAL();
+
+        if (cachedValid && ((now - cachedTick) < pdMS_TO_TICKS(SD_USAGE_CACHE_TTL_MS)))
+        {
+            return FR_OK;
+        }
+    }
+
+    fr = f_getfree(s_fsDrive, &freeClusters, &fs);
+    if ((fr != FR_OK) || (fs == NULL))
+    {
+        taskENTER_CRITICAL();
+        s_sdUsageCache.valid = false;
+        s_sdUsageCache.tick = now;
+        s_sdUsageCache.lastResult = fr;
+        taskEXIT_CRITICAL();
+        return fr;
+    }
+
+    (void)memset(&updated, 0, sizeof(updated));
+    updated.totalBytes = ((uint64_t)(fs->n_fatent - 2U) * (uint64_t)fs->csize * (uint64_t)FF_MAX_SS);
+    updated.freeBytes = ((uint64_t)freeClusters * (uint64_t)fs->csize * (uint64_t)FF_MAX_SS);
+    if (updated.freeBytes > updated.totalBytes)
+    {
+        updated.freeBytes = updated.totalBytes;
+    }
+    updated.usedBytes = updated.totalBytes - updated.freeBytes;
+    if (updated.totalBytes > 0ULL)
+    {
+        uint32_t permille = (uint32_t)((updated.usedBytes * 1000ULL) / updated.totalBytes);
+        if (permille > 1000U)
+        {
+            permille = 1000U;
+        }
+        updated.usedPermille = (uint16_t)permille;
+    }
+    updated.valid = true;
+    updated.tick = now;
+    updated.lastResult = FR_OK;
+
+    taskENTER_CRITICAL();
+    s_sdUsageCache = updated;
+    taskEXIT_CRITICAL();
+    return FR_OK;
+}
+
+bool SdUsageSnapshot(sd_usage_cache_t *snapshot)
+{
+    if (snapshot == NULL)
+    {
+        return false;
+    }
+
+    taskENTER_CRITICAL();
+    *snapshot = s_sdUsageCache;
+    taskEXIT_CRITICAL();
+    return snapshot->valid;
 }
 
 bool FsParseU32(const char *text, uint32_t *value)
@@ -625,6 +747,7 @@ void FsCommandWrite(const char *path, const char *payload, bool append)
         return;
     }
 
+    SdUsageInvalidate();
     ShellWriteLinef("Scritti %lu byte su %s\r\n", (unsigned long)written, path);
 }
 
@@ -645,6 +768,7 @@ void FsCommandMkDir(const char *path)
     fr = f_mkdir(path);
     if (fr == FR_OK)
     {
+        SdUsageInvalidate();
         ShellWriteLinef("Directory creata: %s\r\n", path);
         return;
     }
@@ -678,6 +802,7 @@ void FsCommandRemove(const char *path)
         return;
     }
 
+    SdUsageInvalidate();
     ShellWriteLinef("Rimosso: %s\r\n", path);
 }
 
@@ -702,6 +827,7 @@ void FsCommandMkfs(void)
         return;
     }
 
+    SdUsageInvalidate();
     ShellWrite("mkfs completato e filesystem montato\r\n");
 }
 
@@ -730,6 +856,7 @@ void FsCommandBench(uint32_t totalKiB, uint32_t runs)
         s_fsBenchBuffer[i] = (uint8_t)i;
     }
 
+    SdUsageInvalidate();
     totalBytes = (uint64_t)totalKiB * 1024ULL;
     ShellWriteLinef("Benchmark: %lu KiB x %lu run\r\n", (unsigned long)totalKiB, (unsigned long)runs);
 
@@ -842,6 +969,8 @@ void FsCommandBench(uint32_t totalKiB, uint32_t runs)
                         (unsigned long)(run + 1U), (unsigned long)writeKiBs, (unsigned long)writeMs,
                         (unsigned long)readKiBs, (unsigned long)readMs, (unsigned long)checksum);
     }
+
+    SdUsageInvalidate();
 }
 
 void FsCommand(int32_t argc, char *argv[], const char *rawLine)

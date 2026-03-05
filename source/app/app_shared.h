@@ -67,11 +67,11 @@
 #endif
 
 #define APP_TASK_STACK_WORDS 1280U
-#define APP_TASK_PRIORITY    (tskIDLE_PRIORITY + 5U)
+#define APP_TASK_PRIORITY    (tskIDLE_PRIORITY + 3U)
 #define LED_TASK_STACK_WORDS 256U
 #define LED_TASK_PRIORITY    (tskIDLE_PRIORITY + 2U)
 #define CAN_TASK_STACK_WORDS 1280U
-#define CAN_TASK_PRIORITY    (tskIDLE_PRIORITY + 1U)
+#define CAN_TASK_PRIORITY    (tskIDLE_PRIORITY + 2U)
 
 #define LED_ACTIVITY_PULSE_MS   60U
 #define CAN_HEARTBEAT_PERIOD_MS 100U
@@ -83,6 +83,7 @@
 #define CAN_RX_EXT_MB           11U
 #define CAN1_HEARTBEAT_ID       0x321U
 #define CAN2_HEARTBEAT_ID       0x322U
+#define CAN_AUTOSTART_RETRY_MS  1000U
 
 #define SHELL_PROMPT           "usb-shell> "
 #define SHELL_LINE_BUFFER_SIZE 256U
@@ -96,14 +97,17 @@
 
 #define CAN_UTIL_UPDATE_MS       200U
 
-#define CAN_LOG_PATH                "/canlog.mf4"
 #define CAN_LOG_TASK_STACK_WORDS    768U
-#define CAN_LOG_TASK_PRIORITY       (tskIDLE_PRIORITY + 1U)
+#define CAN_LOG_TASK_PRIORITY       (tskIDLE_PRIORITY + 2U)
 #define CAN_LOG_QUEUE_LENGTH        128U
 #define CAN_LOG_FLUSH_PERIOD_MS     1000U
 #define CAN_LOG_MOUNT_RETRY_MS      1000U
 #define CAN_LOG_SYNC_FRAME_INTERVAL 64U
 #define CAN_LOG_RECORD_SIZE_BYTES   24U
+#define CAN_LOG_PATH_MAX            32U
+#define CAN_LOG_MAX_SEQ_INDEX       100000U
+
+#define SD_USAGE_CACHE_TTL_MS       5000U
 
 #define MF4_CHANNEL_COUNT           6U
 #define MF4_ID_BLOCK_SIZE           64U
@@ -351,6 +355,17 @@ typedef struct
 
 typedef struct
 {
+    bool valid;
+    uint64_t totalBytes;
+    uint64_t freeBytes;
+    uint64_t usedBytes;
+    uint16_t usedPermille;
+    TickType_t tick;
+    FRESULT lastResult;
+} sd_usage_cache_t;
+
+typedef struct
+{
     uint16_t year;
     uint8_t month;
     uint8_t day;
@@ -389,12 +404,16 @@ BaseType_t ShellCliLedCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const
 BaseType_t ShellCliCanCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString);
 BaseType_t ShellCliSdCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString);
 BaseType_t ShellCliRtcCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString);
-void ShellPrintHelp(void);
+BaseType_t ShellCliTimeCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString);
+BaseType_t ShellCliLogCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString);
 void LedMarkCanActivity(void);
 
 FRESULT FsMount(void);
 FRESULT FsUnmount(void);
 bool FsEnsureMounted(void);
+void SdUsageInvalidate(void);
+FRESULT SdUsageRefresh(bool force);
+bool SdUsageSnapshot(sd_usage_cache_t *snapshot);
 const char *FsResultToString(FRESULT result);
 bool FsParseU32(const char *text, uint32_t *value);
 void FsCommand(int32_t argc, char *argv[], const char *rawLine);
@@ -412,12 +431,11 @@ bool RtcInit(void);
 bool RtcIsValid(void);
 uint32_t RtcGetUnixSeconds(void);
 bool RtcSetUnixSeconds(uint32_t unixSeconds);
+bool RtcAutoSetFromBuildIfInvalid(void);
 bool RtcUnixSecondsToDateTime(uint32_t unixSeconds, rtc_datetime_t *dateTime);
 void RtcCommand(int32_t argc, char *argv[]);
 
 status_t CanInitAll(uint32_t bitRate, uint32_t modeFlags);
-status_t CanSendFromShell(uint32_t busIndex, uint32_t id, const uint8_t *payload, uint8_t length);
-void CanCommand(int32_t argc, char *argv[]);
 status_t CanReleaseStopMode(CAN_Type *base);
 status_t CanInitOneWithFlags(can_bus_context_t *bus, uint32_t bitRate, uint32_t modeFlags);
 status_t CanDeinitOne(can_bus_context_t *bus);
@@ -473,6 +491,7 @@ bool Mf4WriteFreshFile(FIL *file, mf4_log_state_t *state);
 bool Mf4RecoverFile(FIL *file, mf4_log_state_t *state);
 bool Mf4PatchCounters(FIL *file, const mf4_log_state_t *state);
 bool Mf4Sync(FIL *file, const mf4_log_state_t *state);
+bool CanLogOpenFile(FIL *file, mf4_log_state_t *state);
 
 bool CanLogEnqueue(size_t busIndex, const flexcan_frame_t *frame, status_t status);
 
@@ -507,7 +526,6 @@ extern volatile bool s_ledActivitySeen;
 extern volatile bool s_cdcOutPrimed;
 extern volatile uint32_t s_gsCanOutSize;
 extern volatile bool s_rtcInitialized;
-extern bool s_shellProductionMode;
 extern bool s_shellCliReady;
 extern TickType_t s_canUtilLastTick;
 extern bool s_canUtilInitialized;
@@ -520,7 +538,10 @@ extern bool s_fsMounted;
 extern const TCHAR s_fsDrive[];
 extern FIL s_canLogFile;
 extern bool s_canLogFileOpen;
+extern char s_canLogActivePath[CAN_LOG_PATH_MAX];
+extern uint32_t s_canLogNextIndex;
 extern mf4_log_state_t s_mf4LogState;
+extern sd_usage_cache_t s_sdUsageCache;
 
 extern const mf4_channel_desc_t s_mf4Channels[MF4_CHANNEL_COUNT];
 extern can_bus_context_t s_canBuses[GS_USB_CHANNEL_COUNT];
@@ -529,6 +550,9 @@ extern volatile bool s_canHeartbeatEnabled;
 extern volatile bool s_canDumpEnabled;
 extern volatile uint32_t s_canBitRate;
 extern volatile uint32_t s_canModeFlags;
+extern volatile bool s_canAutoStartEnabled;
+extern volatile bool s_logEnabled;
+extern volatile bool s_logAllowWhenUsbAttached;
 
 extern QueueHandle_t s_canLogQueue;
 extern SemaphoreHandle_t s_shellTxMutex;

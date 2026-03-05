@@ -1,0 +1,11 @@
+if(NOT DEFINED OUTPUT_FILE)
+  message(FATAL_ERROR "OUTPUT_FILE non definito")
+endif()
+
+string(TIMESTAMP NOW_EPOCH "%s" UTC)
+file(WRITE "${OUTPUT_FILE}" "#ifndef BUILD_EPOCH_H\n")
+file(APPEND "${OUTPUT_FILE}" "#define BUILD_EPOCH_H\n")
+file(APPEND "${OUTPUT_FILE}" "\n")
+file(APPEND "${OUTPUT_FILE}" "#define APP_BUILD_UNIX_EPOCH ${NOW_EPOCH}UL\n")
+file(APPEND "${OUTPUT_FILE}" "\n")
+file(APPEND "${OUTPUT_FILE}" "#endif /* BUILD_EPOCH_H */\n")

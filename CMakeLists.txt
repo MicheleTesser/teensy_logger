@@ -13,6 +13,9 @@ endif()
 set(PROJECT_TARGET "${PROJECT_NAME}.elf")
 set(LINKER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/MIMXRT1062_flash.ld")
 set(FREERTOS_KERNEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/FreeRTOS-Kernel")
+set(FATFS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fatfs")
+set(GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(BUILD_EPOCH_HEADER "${GENERATED_INCLUDE_DIR}/build_epoch.h")
 set(ARM_CPU_FLAGS
   -mcpu=cortex-m7
   -mthumb
@@ -60,10 +63,10 @@ set(PROJECT_SOURCES
   middleware/usb/device/class/usb_device_cdc_acm.c
   middleware/usb/phy/usb_phy.c
 
-  fatfs/source/ff.c
-  fatfs/source/diskio.c
-  fatfs/source/ffsystem.c
-  fatfs/source/fsl_sd_disk/fsl_sd_disk.c
+  ${FATFS_DIR}/source/ff.c
+  ${FATFS_DIR}/source/diskio.c
+  ${FATFS_DIR}/source/ffsystem.c
+  ${FATFS_DIR}/source/fsl_sd_disk/fsl_sd_disk.c
 
   sdmmc/common/fsl_sdmmc_common.c
   sdmmc/osa/fsl_sdmmc_osa.c
@@ -84,6 +87,18 @@ set(PROJECT_SOURCES
 
 add_executable(${PROJECT_TARGET} ${PROJECT_SOURCES})
 
+add_custom_target(generate_build_epoch_header ALL
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_INCLUDE_DIR}"
+  COMMAND ${CMAKE_COMMAND}
+          -DOUTPUT_FILE=${BUILD_EPOCH_HEADER}
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/gen_build_epoch.cmake"
+  BYPRODUCTS "${BUILD_EPOCH_HEADER}"
+  COMMENT "Generating build epoch header"
+  VERBATIM
+)
+
+add_dependencies(${PROJECT_TARGET} generate_build_epoch_header)
+
 target_include_directories(${PROJECT_TARGET}
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -94,8 +109,8 @@ target_include_directories(${PROJECT_TARGET}
     ${CMAKE_CURRENT_SOURCE_DIR}/components/osa/config
     ${CMAKE_CURRENT_SOURCE_DIR}/device
     ${CMAKE_CURRENT_SOURCE_DIR}/drivers
-    ${CMAKE_CURRENT_SOURCE_DIR}/fatfs/source
-    ${CMAKE_CURRENT_SOURCE_DIR}/fatfs/source/fsl_sd_disk
+    ${FATFS_DIR}/source
+    ${FATFS_DIR}/source/fsl_sd_disk
     ${FREERTOS_KERNEL_DIR}/include
     ${FREERTOS_KERNEL_DIR}/portable/GCC/ARM_CM7/r0p1
     ${CMAKE_CURRENT_SOURCE_DIR}/middleware/usb/include
@@ -110,6 +125,7 @@ target_include_directories(${PROJECT_TARGET}
     ${CMAKE_CURRENT_SOURCE_DIR}/source
     ${CMAKE_CURRENT_SOURCE_DIR}/utilities
     ${CMAKE_CURRENT_SOURCE_DIR}/xip
+    ${GENERATED_INCLUDE_DIR}
 )
 
 target_compile_definitions(${PROJECT_TARGET}

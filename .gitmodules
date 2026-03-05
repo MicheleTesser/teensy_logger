@@ -1,3 +1,12 @@
 [submodule "third_party/FreeRTOS-Kernel"]
 	path = third_party/FreeRTOS-Kernel
 	url = https://github.com/FreeRTOS/FreeRTOS-Kernel.git
+[submodule "third_party/fatfs"]
+	path = third_party/fatfs
+	url = https://github.com/abbrev/fatfs.git
+[submodule "third_party/tinyusb"]
+	path = third_party/tinyusb
+	url = https://github.com/hathach/tinyusb.git
+[submodule "third_party/mdflib"]
+	path = third_party/mdflib
+	url = https://github.com/ihedvall/mdflib.git

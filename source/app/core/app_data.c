@@ -41,7 +41,6 @@ volatile bool s_ledActivitySeen = false;
 volatile bool s_cdcOutPrimed = false;
 volatile uint32_t s_gsCanOutSize = 0U;
 volatile bool s_rtcInitialized = false;
-bool s_shellProductionMode = true;
 bool s_shellCliReady = false;
 TickType_t s_canUtilLastTick = 0U;
 bool s_canUtilInitialized = false;
@@ -54,7 +53,10 @@ bool s_fsMounted = false;
 const TCHAR s_fsDrive[] = {SDDISK + '0', ':', '/', '\0'};
 FIL s_canLogFile;
 bool s_canLogFileOpen = false;
+char s_canLogActivePath[CAN_LOG_PATH_MAX] = {0};
+uint32_t s_canLogNextIndex = 0U;
 mf4_log_state_t s_mf4LogState;
+sd_usage_cache_t s_sdUsageCache = {.valid = false, .lastResult = FR_NOT_READY};
 
 const mf4_channel_desc_t s_mf4Channels[MF4_CHANNEL_COUNT] = {
     {.name = "timestamp_ns",
@@ -114,6 +116,9 @@ volatile bool s_canHeartbeatEnabled = false;
 volatile bool s_canDumpEnabled = false;
 volatile uint32_t s_canBitRate = CAN_DEFAULT_BITRATE;
 volatile uint32_t s_canModeFlags = 0U;
+volatile bool s_canAutoStartEnabled = true;
+volatile bool s_logEnabled = true;
+volatile bool s_logAllowWhenUsbAttached = true;
 
 QueueHandle_t s_canLogQueue = NULL;
 SemaphoreHandle_t s_shellTxMutex = NULL;
