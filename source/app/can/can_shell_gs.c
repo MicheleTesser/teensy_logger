@@ -4,11 +4,38 @@
  * Module: CAN runtime/polling + shell command handlers + gs_usb protocol control path.
  * Focus area when host sees only one channel, deferred start/reset, or queue stalls.
  */
-void CanPollRxMb(can_bus_context_t *bus, size_t busIndex, uint8_t mbIdx)
+static const uint8_t s_gsCanTxMbList[] = {
+    12U, 13U, 14U, 15U, 16U, 17U, 18U, 19U, 20U, 21U,
+    22U, 23U, 24U, 25U, 26U, 27U, 28U, 29U, 30U, 31U,
+};
+
+static void CanRxFifoPushFromIsr(size_t busIndex, const flexcan_frame_t *frame, status_t status)
+{
+    uint16_t head;
+    uint16_t nextHead;
+
+    if ((frame == NULL) || (busIndex >= GS_USB_CHANNEL_COUNT))
+    {
+        return;
+    }
+
+    head = s_canRxFifoHead[busIndex];
+    nextHead = (uint16_t)((head + 1U) & CAN_ISR_RX_FIFO_MASK);
+    if (nextHead == s_canRxFifoTail[busIndex])
+    {
+        s_canRxFifoOverflow[busIndex] = true;
+        return;
+    }
+
+    s_canRxFifo[busIndex][head].frame = *frame;
+    s_canRxFifo[busIndex][head].status = status;
+    s_canRxFifoHead[busIndex] = nextHead;
+}
+
+static void CanDrainRxMbIsr(can_bus_context_t *bus, size_t busIndex, uint8_t mbIdx)
 {
     uint64_t mbMask;
-    flexcan_frame_t frame;
-    status_t status;
+    uint32_t drainGuard = 0U;
 
     if ((bus == NULL) || !bus->started)
     {
@@ -16,16 +43,322 @@ void CanPollRxMb(can_bus_context_t *bus, size_t busIndex, uint8_t mbIdx)
     }
 
     mbMask = (uint64_t)1U << mbIdx;
-    if (FLEXCAN_GetMbStatusFlags(bus->base, mbMask) == 0U)
+    while (drainGuard < 64U)
+    {
+        flexcan_frame_t frame;
+        status_t status;
+
+        if (FLEXCAN_GetMbStatusFlags(bus->base, mbMask) == 0U)
+        {
+            break;
+        }
+
+        status = FLEXCAN_ReadRxMb(bus->base, mbIdx, &frame);
+        FLEXCAN_ClearMbStatusFlags(bus->base, mbMask);
+        if ((status == kStatus_Success) || (status == kStatus_FLEXCAN_RxOverflow))
+        {
+            CanRxFifoPushFromIsr(busIndex, &frame, status);
+        }
+        drainGuard++;
+    }
+}
+
+static void CanServiceIsr(size_t busIndex)
+{
+    if (busIndex >= ARRAY_SIZE(s_canBuses))
     {
         return;
     }
 
-    FLEXCAN_ClearMbStatusFlags(bus->base, mbMask);
-    status = FLEXCAN_ReadRxMb(bus->base, mbIdx, &frame);
-    if ((status == kStatus_Success) || (status == kStatus_FLEXCAN_RxOverflow))
+    CanDrainRxMbIsr(&s_canBuses[busIndex], busIndex, s_canBuses[busIndex].rxStdMb);
+    CanDrainRxMbIsr(&s_canBuses[busIndex], busIndex, s_canBuses[busIndex].rxExtMb);
+}
+
+void CAN1_IRQHandler(void)
+{
+    CanServiceIsr(0U);
+    SDK_ISR_EXIT_BARRIER;
+}
+
+void CAN2_IRQHandler(void)
+{
+    CanServiceIsr(1U);
+    SDK_ISR_EXIT_BARRIER;
+}
+
+void CanRxFifoReset(size_t busIndex)
+{
+    if (busIndex >= GS_USB_CHANNEL_COUNT)
     {
-        CanHandleRxFrame(busIndex, &frame, status);
+        return;
+    }
+
+    taskENTER_CRITICAL();
+    s_canRxFifoHead[busIndex] = 0U;
+    s_canRxFifoTail[busIndex] = 0U;
+    s_canRxFifoOverflow[busIndex] = false;
+    taskEXIT_CRITICAL();
+}
+
+bool CanRxFifoPop(size_t busIndex, flexcan_frame_t *frame, status_t *status)
+{
+    bool hasFrame = false;
+
+    if ((busIndex >= GS_USB_CHANNEL_COUNT) || (frame == NULL) || (status == NULL))
+    {
+        return false;
+    }
+
+    taskENTER_CRITICAL();
+    if (s_canRxFifoTail[busIndex] != s_canRxFifoHead[busIndex])
+    {
+        uint16_t tail = s_canRxFifoTail[busIndex];
+        *frame = s_canRxFifo[busIndex][tail].frame;
+        *status = s_canRxFifo[busIndex][tail].status;
+        s_canRxFifoTail[busIndex] = (uint16_t)((tail + 1U) & CAN_ISR_RX_FIFO_MASK);
+        hasFrame = true;
+    }
+    taskEXIT_CRITICAL();
+
+    return hasFrame;
+}
+
+bool CanProcessRxFifo(uint32_t budgetPerBus)
+{
+    bool processedAny = false;
+    size_t i;
+
+    if (budgetPerBus == 0U)
+    {
+        budgetPerBus = 1U;
+    }
+
+    for (i = 0U; i < ARRAY_SIZE(s_canBuses); i++)
+    {
+        uint32_t budget = budgetPerBus;
+        flexcan_frame_t frame;
+        status_t status;
+
+        while ((budget > 0U) && CanRxFifoPop(i, &frame, &status))
+        {
+            CanHandleRxFrame(i, &frame, status);
+            processedAny = true;
+            budget--;
+        }
+
+        if (s_canRxFifoOverflow[i])
+        {
+            s_canRxFifoOverflow[i] = false;
+            s_canBuses[i].rxOverflowCount++;
+            GsCanSetOverflowFlag(i);
+            processedAny = true;
+        }
+    }
+
+    return processedAny;
+}
+
+void GsCanTxQueueReset(size_t busIndex)
+{
+    if (busIndex >= GS_USB_CHANNEL_COUNT)
+    {
+        return;
+    }
+
+    taskENTER_CRITICAL();
+    s_canGsTxHead[busIndex] = 0U;
+    s_canGsTxTail[busIndex] = 0U;
+    s_canGsTxCount[busIndex] = 0U;
+    s_canGsTxMbCursor[busIndex] = 0U;
+    taskEXIT_CRITICAL();
+}
+
+bool GsCanTxQueuePush(size_t busIndex, uint32_t echoId, const flexcan_frame_t *frame)
+{
+    uint16_t head;
+    uint16_t nextHead;
+
+    if ((busIndex >= GS_USB_CHANNEL_COUNT) || (frame == NULL))
+    {
+        return false;
+    }
+
+    taskENTER_CRITICAL();
+    head = s_canGsTxHead[busIndex];
+    nextHead = (uint16_t)((head + 1U) & CAN_GS_TX_QUEUE_MASK);
+    if (nextHead == s_canGsTxTail[busIndex])
+    {
+        taskEXIT_CRITICAL();
+        return false;
+    }
+
+    s_canGsTxQueue[busIndex][head].frame = *frame;
+    s_canGsTxQueue[busIndex][head].echoId = echoId;
+    s_canGsTxHead[busIndex] = nextHead;
+    s_canGsTxCount[busIndex]++;
+    taskEXIT_CRITICAL();
+    return true;
+}
+
+static bool GsCanTxQueuePeek(size_t busIndex, can_gs_tx_entry_t *entry)
+{
+    bool hasEntry = false;
+
+    if ((busIndex >= GS_USB_CHANNEL_COUNT) || (entry == NULL))
+    {
+        return false;
+    }
+
+    taskENTER_CRITICAL();
+    if (s_canGsTxTail[busIndex] != s_canGsTxHead[busIndex])
+    {
+        *entry = s_canGsTxQueue[busIndex][s_canGsTxTail[busIndex]];
+        hasEntry = true;
+    }
+    taskEXIT_CRITICAL();
+    return hasEntry;
+}
+
+static void GsCanTxQueueDropFront(size_t busIndex)
+{
+    if (busIndex >= GS_USB_CHANNEL_COUNT)
+    {
+        return;
+    }
+
+    taskENTER_CRITICAL();
+    if (s_canGsTxTail[busIndex] != s_canGsTxHead[busIndex])
+    {
+        s_canGsTxTail[busIndex] = (uint16_t)((s_canGsTxTail[busIndex] + 1U) & CAN_GS_TX_QUEUE_MASK);
+        if (s_canGsTxCount[busIndex] > 0U)
+        {
+            s_canGsTxCount[busIndex]--;
+        }
+    }
+    taskEXIT_CRITICAL();
+}
+
+bool GsCanTxQueueHasPending(void)
+{
+    return (s_canGsTxCount[0] != 0U) || (s_canGsTxCount[1] != 0U);
+}
+
+static bool GsCanTrySendQueuedFrame(size_t busIndex, const can_gs_tx_entry_t *entry)
+{
+    can_bus_context_t *bus;
+    size_t attempt;
+
+    if ((entry == NULL) || (busIndex >= ARRAY_SIZE(s_canBuses)))
+    {
+        return false;
+    }
+
+    bus = &s_canBuses[busIndex];
+    for (attempt = 0U; attempt < ARRAY_SIZE(s_gsCanTxMbList); attempt++)
+    {
+        uint8_t cursor = s_canGsTxMbCursor[busIndex];
+        uint8_t mbIdx = s_gsCanTxMbList[cursor];
+        status_t status = CanWriteTxMbWithRecovery(bus, mbIdx, &entry->frame);
+        cursor++;
+        if (cursor >= ARRAY_SIZE(s_gsCanTxMbList))
+        {
+            cursor = 0U;
+        }
+        s_canGsTxMbCursor[busIndex] = cursor;
+
+        if (status == kStatus_Success)
+        {
+            bus->txOkCount++;
+            bus->txBitCount += CanEstimateFrameBits(&entry->frame);
+            LedMarkCanActivity();
+            return true;
+        }
+        if (status != kStatus_FLEXCAN_TxBusy)
+        {
+            bus->txErrCount++;
+        }
+    }
+
+    return false;
+}
+
+bool GsCanServiceTxQueues(uint32_t budgetPerBus)
+{
+    bool sentAny = false;
+    size_t busIndex;
+
+    if (budgetPerBus == 0U)
+    {
+        budgetPerBus = 1U;
+    }
+
+    for (busIndex = 0U; busIndex < GS_USB_CHANNEL_COUNT; busIndex++)
+    {
+        uint32_t budget = budgetPerBus;
+
+        if (!s_canBuses[busIndex].started)
+        {
+            continue;
+        }
+
+        while (budget > 0U)
+        {
+            can_gs_tx_entry_t entry;
+
+            if (!GsCanTxQueuePeek(busIndex, &entry))
+            {
+                break;
+            }
+
+            if (!GsCanTrySendQueuedFrame(busIndex, &entry))
+            {
+                break;
+            }
+
+            GsCanTxQueueDropFront(busIndex);
+            if (!GsCanTxEchoPublish(busIndex, entry.echoId, &entry.frame))
+            {
+                GsCanSetOverflowFlag(busIndex);
+            }
+            sentAny = true;
+            budget--;
+        }
+    }
+
+    return sentAny;
+}
+
+void CanPollRxMb(can_bus_context_t *bus, size_t busIndex, uint8_t mbIdx)
+{
+    uint64_t mbMask;
+    flexcan_frame_t frame;
+    status_t status;
+    uint32_t drainGuard = 0U;
+
+    if ((bus == NULL) || !bus->started)
+    {
+        return;
+    }
+
+    mbMask = (uint64_t)1U << mbIdx;
+    while (drainGuard < 64U)
+    {
+        if (APP_LIKELY(FLEXCAN_GetMbStatusFlags(bus->base, mbMask) == 0U))
+        {
+            break;
+        }
+
+        status = FLEXCAN_ReadRxMb(bus->base, mbIdx, &frame);
+        FLEXCAN_ClearMbStatusFlags(bus->base, mbMask);
+        if (APP_LIKELY(status == kStatus_Success))
+        {
+            CanHandleRxFrame(busIndex, &frame, status);
+        }
+        else if (status == kStatus_FLEXCAN_RxOverflow)
+        {
+            CanHandleRxFrame(busIndex, &frame, status);
+        }
+        drainGuard++;
     }
 }
 
@@ -40,11 +373,13 @@ void CanPollRxDump(void)
 
     for (i = 0U; i < ARRAY_SIZE(s_canBuses); i++)
     {
-      if (s_canBuses[i].started)
-      {
+        if (!s_canBuses[i].started)
+        {
+            continue;
+        }
+
         CanPollRxMb(&s_canBuses[i], i, s_canBuses[i].rxStdMb);
         CanPollRxMb(&s_canBuses[i], i, s_canBuses[i].rxExtMb);
-      }
     }
 }
 
@@ -87,6 +422,8 @@ status_t CanInitAll(uint32_t bitRate, uint32_t modeFlags)
 void ShellHandleLine(char *line)
 {
     char rawLine[SHELL_LINE_BUFFER_SIZE];
+    char *start;
+    size_t len;
     char cliOutput[SHELL_CLI_OUTPUT_SIZE];
     BaseType_t moreData;
     const char *commandInput;
@@ -98,7 +435,24 @@ void ShellHandleLine(char *line)
 
     (void)strncpy(rawLine, line, sizeof(rawLine) - 1U);
     rawLine[sizeof(rawLine) - 1U] = '\0';
-    if (rawLine[0] == '\0')
+
+    /* Normalize: trim leading/trailing spaces/tabs to avoid false "unknown command". */
+    start = rawLine;
+    while ((*start == ' ') || (*start == '\t'))
+    {
+        start++;
+    }
+    if (*start == '\0')
+    {
+        return;
+    }
+    len = strlen(start);
+    while ((len > 0U) && ((start[len - 1U] == ' ') || (start[len - 1U] == '\t')))
+    {
+        start[len - 1U] = '\0';
+        len--;
+    }
+    if (start[0] == '\0')
     {
         return;
     }
@@ -109,7 +463,7 @@ void ShellHandleLine(char *line)
         return;
     }
 
-    commandInput = rawLine;
+    commandInput = start;
     do
     {
         cliOutput[0] = '\0';
@@ -127,6 +481,7 @@ void ShellHandlePacket(const uint8_t *data, uint32_t length)
     static char lineBuffer[SHELL_LINE_BUFFER_SIZE];
     static size_t lineLength = 0U;
     static bool skipNextLf   = false;
+    static bool inAnsiEscape = false;
     uint32_t i;
 
     for (i = 0U; i < length; i++)
@@ -139,6 +494,22 @@ void ShellHandlePacket(const uint8_t *data, uint32_t length)
             continue;
         }
         skipNextLf = false;
+
+        /* Ignore simple ANSI escape sequences often emitted by terminal arrow keys. */
+        if (inAnsiEscape)
+        {
+            if (((ch >= (uint8_t)'A') && (ch <= (uint8_t)'Z')) ||
+                ((ch >= (uint8_t)'a') && (ch <= (uint8_t)'z')) || (ch == (uint8_t)'~'))
+            {
+                inAnsiEscape = false;
+            }
+            continue;
+        }
+        if (ch == 0x1BU)
+        {
+            inAnsiEscape = true;
+            continue;
+        }
 
         if ((ch == (uint8_t)'\r') || (ch == (uint8_t)'\n'))
         {
@@ -176,17 +547,16 @@ void ShellHandlePacket(const uint8_t *data, uint32_t length)
 void CanRefreshReadyState(void)
 {
     size_t i;
-    bool anyStarted = false;
 
     for (i = 0U; i < ARRAY_SIZE(s_canBuses); i++)
     {
         if (s_canBuses[i].started)
         {
-            anyStarted = true;
-            break;
+            s_canReady = true;
+            return;
         }
     }
-    s_canReady = anyStarted;
+    s_canReady = false;
 }
 
 bool CanAnyControllerStarted(void)
@@ -225,7 +595,7 @@ void GsCanProcessDeferredRequests(void)
         uint32_t flags;
         status_t status = kStatus_Success;
 
-        if (s_gsCanDeferredReq[channel].pending == 0U)
+        if (APP_LIKELY(s_gsCanDeferredReq[channel].pending == 0U))
         {
             continue;
         }
@@ -236,34 +606,41 @@ void GsCanProcessDeferredRequests(void)
         s_gsCanDeferredReq[channel].pending = 0U;
         s_gsCanDeferredReq[channel].op = GS_CAN_DEFERRED_OP_NONE;
 
-        if (op == GS_CAN_DEFERRED_OP_START)
+        switch (op)
         {
-            bool needsReinit = !s_canBuses[channel].started ||
-                               (s_canBuses[channel].bitRate != bitRate) ||
-                               (s_canBuses[channel].modeFlags != flags);
+            case GS_CAN_DEFERRED_OP_START:
+            {
+                bool needsReinit = !s_canBuses[channel].started ||
+                                   (s_canBuses[channel].bitRate != bitRate) ||
+                                   (s_canBuses[channel].modeFlags != flags);
 
-            if (needsReinit)
+                if (needsReinit)
+                {
+                    if (s_canBuses[channel].started)
+                    {
+                        (void)CanDeinitOne(&s_canBuses[channel]);
+                    }
+
+                    CanApplyGsClockRoot();
+                    status = CanInitOneWithFlags(&s_canBuses[channel], bitRate, flags);
+                    if (status == kStatus_Success)
+                    {
+                        s_canBitRate = bitRate;
+                        s_canModeFlags = flags;
+                    }
+                }
+                break;
+            }
+            case GS_CAN_DEFERRED_OP_RESET:
             {
                 if (s_canBuses[channel].started)
                 {
                     (void)CanDeinitOne(&s_canBuses[channel]);
                 }
-
-                CanApplyGsClockRoot();
-                status = CanInitOneWithFlags(&s_canBuses[channel], bitRate, flags);
-                if (status == kStatus_Success)
-                {
-                    s_canBitRate = bitRate;
-                    s_canModeFlags = flags;
-                }
+                break;
             }
-        }
-        else if (op == GS_CAN_DEFERRED_OP_RESET)
-        {
-            if (s_canBuses[channel].started)
-            {
-                (void)CanDeinitOne(&s_canBuses[channel]);
-            }
+            default:
+                break;
         }
 
         CanRefreshReadyState();
@@ -287,7 +664,6 @@ void GsCanHandleBulkOutPacket(const uint8_t *data, uint32_t length)
         uint32_t echoId = GsWireToCpu32(hostFrame->echoId);
         uint8_t dlc = hostFrame->canDlc;
         flexcan_frame_t txFrame;
-        status_t status;
 
         offset += sizeof(gs_host_frame_classic_t);
 
@@ -321,23 +697,24 @@ void GsCanHandleBulkOutPacket(const uint8_t *data, uint32_t length)
         else
         {
             txFrame.type = (uint32_t)kFLEXCAN_FrameTypeData;
-            txFrame.dataByte0 = (dlc > 0U) ? hostFrame->data[0] : 0U;
-            txFrame.dataByte1 = (dlc > 1U) ? hostFrame->data[1] : 0U;
-            txFrame.dataByte2 = (dlc > 2U) ? hostFrame->data[2] : 0U;
-            txFrame.dataByte3 = (dlc > 3U) ? hostFrame->data[3] : 0U;
-            txFrame.dataByte4 = (dlc > 4U) ? hostFrame->data[4] : 0U;
-            txFrame.dataByte5 = (dlc > 5U) ? hostFrame->data[5] : 0U;
-            txFrame.dataByte6 = (dlc > 6U) ? hostFrame->data[6] : 0U;
-            txFrame.dataByte7 = (dlc > 7U) ? hostFrame->data[7] : 0U;
+            txFrame.dataByte0 = hostFrame->data[0];
+            txFrame.dataByte1 = hostFrame->data[1];
+            txFrame.dataByte2 = hostFrame->data[2];
+            txFrame.dataByte3 = hostFrame->data[3];
+            txFrame.dataByte4 = hostFrame->data[4];
+            txFrame.dataByte5 = hostFrame->data[5];
+            txFrame.dataByte6 = hostFrame->data[6];
+            txFrame.dataByte7 = hostFrame->data[7];
         }
 
-        status = CanSendFrameRaw(&s_canBuses[channel], s_canBuses[channel].shellTxMb, &txFrame);
-        (void)status;
-
-        /* Always return an echo frame so the host gs_usb queue cannot stall waiting for completion. */
-        if (!GsCanTxEchoPublish(channel, echoId, &txFrame))
+        if (!GsCanTxQueuePush(channel, echoId, &txFrame))
         {
-            GsCanSetOverflowFlag(channel);
+            s_canBuses[channel].txErrCount++;
+            /* Never leave host TX frames without completion echo: otherwise SocketCAN can stall. */
+            if (!GsCanTxEchoPublish(channel, echoId, &txFrame))
+            {
+                GsCanSetOverflowFlag(channel);
+            }
         }
     }
 }

@@ -425,7 +425,7 @@ extern void _vStackTop(void);
 //*****************************************************************************
 
 extern void (* const g_pfnVectors[])(void);
-extern void * __Vectors __attribute__ ((alias ("g_pfnVectors")));
+extern void (* const __Vectors[])(void) __attribute__ ((alias ("g_pfnVectors")));
 
 __attribute__ ((used, section(".isr_vector")))
 void (* const g_pfnVectors[])(void) = {

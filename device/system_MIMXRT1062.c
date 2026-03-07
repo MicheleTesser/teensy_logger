@@ -76,7 +76,7 @@ void SystemInit (void) {
 #endif /* ((__FPU_PRESENT == 1) && (__FPU_USED == 1)) */
 
 #if defined(__MCUXPRESSO)
-    extern uint32_t g_pfnVectors[];  // Vector table defined in startup code
+    extern void (* const g_pfnVectors[])(void);  // Vector table defined in startup code
     SCB->VTOR = (uint32_t)g_pfnVectors;
 #endif
 

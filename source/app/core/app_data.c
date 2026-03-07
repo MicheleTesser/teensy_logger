@@ -30,7 +30,7 @@ uint8_t s_countryCode[COMM_FEATURE_DATA_SIZE] = {
 USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) uint8_t s_recvBuffer[DATA_BUFF_SIZE];
 USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) uint8_t s_sendBuffer[DATA_BUFF_SIZE];
 USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) uint8_t s_gsCanOutBuffer[GS_USB_MAX_PACKET_SIZE];
-USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) gs_host_frame_classic_t s_gsCanInFrame;
+USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) gs_host_frame_classic_t s_gsCanInFrames[GS_USB_MAX_FRAMES_PER_TRANSFER];
 
 volatile uint32_t s_recvSize = 0U;
 volatile uint8_t s_txBusy = 0U;
@@ -41,6 +41,8 @@ volatile bool s_ledActivitySeen = false;
 volatile bool s_cdcOutPrimed = false;
 volatile uint32_t s_gsCanOutSize = 0U;
 volatile bool s_rtcInitialized = false;
+volatile bool s_bootloaderRebootPending = false;
+volatile TickType_t s_bootloaderRebootDeadline = 0U;
 bool s_shellCliReady = false;
 TickType_t s_canUtilLastTick = 0U;
 bool s_canUtilInitialized = false;
@@ -52,7 +54,7 @@ bool s_fsConfigured = false;
 bool s_fsMounted = false;
 const TCHAR s_fsDrive[] = {SDDISK + '0', ':', '/', '\0'};
 FIL s_canLogFile;
-bool s_canLogFileOpen = false;
+volatile bool s_canLogFileOpen = false;
 char s_canLogActivePath[CAN_LOG_PATH_MAX] = {0};
 uint32_t s_canLogNextIndex = 0U;
 mf4_log_state_t s_mf4LogState;
@@ -118,7 +120,8 @@ volatile uint32_t s_canBitRate = CAN_DEFAULT_BITRATE;
 volatile uint32_t s_canModeFlags = 0U;
 volatile bool s_canAutoStartEnabled = true;
 volatile bool s_logEnabled = true;
-volatile bool s_logAllowWhenUsbAttached = true;
+volatile bool s_logAllowWhenUsbAttached = false;
+volatile bool s_mscHostActive = false;
 
 QueueHandle_t s_canLogQueue = NULL;
 SemaphoreHandle_t s_shellTxMutex = NULL;
@@ -135,6 +138,16 @@ volatile bool s_gsCanOverflowPending[GS_USB_CHANNEL_COUNT] = {false, false};
 gs_host_frame_classic_t s_gsCanTxQueue[GS_USB_FRAME_QUEUE_LENGTH];
 gs_can_deferred_request_t s_gsCanDeferredReq[GS_USB_CHANNEL_COUNT];
 
+volatile uint16_t s_canRxFifoHead[GS_USB_CHANNEL_COUNT] = {0U, 0U};
+volatile uint16_t s_canRxFifoTail[GS_USB_CHANNEL_COUNT] = {0U, 0U};
+volatile bool s_canRxFifoOverflow[GS_USB_CHANNEL_COUNT] = {false, false};
+can_isr_rx_entry_t s_canRxFifo[GS_USB_CHANNEL_COUNT][CAN_ISR_RX_FIFO_LENGTH];
+volatile uint16_t s_canGsTxHead[GS_USB_CHANNEL_COUNT] = {0U, 0U};
+volatile uint16_t s_canGsTxTail[GS_USB_CHANNEL_COUNT] = {0U, 0U};
+volatile uint16_t s_canGsTxCount[GS_USB_CHANNEL_COUNT] = {0U, 0U};
+volatile uint8_t s_canGsTxMbCursor[GS_USB_CHANNEL_COUNT] = {0U, 0U};
+can_gs_tx_entry_t s_canGsTxQueue[GS_USB_CHANNEL_COUNT][CAN_GS_TX_QUEUE_LENGTH];
+
 gs_host_config_t s_gsHostConfig;
 gs_device_bittiming_t s_gsBitTiming;
 gs_device_mode_t s_gsModeRequest;
@@ -146,13 +159,18 @@ gs_device_bittiming_t s_gsBitTimingByChannel[GS_USB_CHANNEL_COUNT];
 bool s_gsBitTimingValid[GS_USB_CHANNEL_COUNT] = {false, false};
 
 usb_device_class_config_struct_t s_cdcAcmConfig[] = {{
-    USB_DeviceCdcVcomCallback,
-    0U,
-    &g_UsbDeviceCdcVcomConfig,
-}};
+                                                        USB_DeviceCdcVcomCallback,
+                                                        0U,
+                                                        &g_UsbDeviceCdcVcomConfig,
+                                                    },
+                                                    {
+                                                        USB_DeviceMscCallback,
+                                                        0U,
+                                                        &g_UsbDeviceMscDiskConfig,
+                                                    }};
 
 usb_device_class_config_list_struct_t s_cdcAcmConfigList = {
     s_cdcAcmConfig,
     USB_DeviceCallback,
-    1U,
+    2U,
 };

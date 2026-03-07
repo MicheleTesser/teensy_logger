@@ -43,12 +43,28 @@ status_t CanReleaseStopMode(CAN_Type *base)
     return kStatus_Success;
 }
 
+static IRQn_Type CanGetIrqFromBase(const CAN_Type *base)
+{
+    if (base == CAN1)
+    {
+        return CAN1_IRQn;
+    }
+    if (base == CAN2)
+    {
+        return CAN2_IRQn;
+    }
+    return NotAvail_IRQn;
+}
+
 status_t CanInitOneWithFlags(can_bus_context_t *bus, uint32_t bitRate, uint32_t modeFlags)
 {
     flexcan_config_t config;
     flexcan_rx_mb_config_t rxStdConfig;
     flexcan_rx_mb_config_t rxExtConfig;
+    uint8_t mbIdx;
     status_t status;
+    IRQn_Type canIrq;
+    uint64_t rxMask;
     uint32_t sourceClock = CLOCK_GetClockRootFreq(kCLOCK_CanClkRoot);
 
     if (sourceClock == 0U)
@@ -64,7 +80,7 @@ status_t CanInitOneWithFlags(can_bus_context_t *bus, uint32_t bitRate, uint32_t 
 
     FLEXCAN_GetDefaultConfig(&config);
     config.bitRate          = bitRate;
-    config.maxMbNum           = 16U;
+    config.maxMbNum           = 32U;
     config.enableLoopBack     = ((modeFlags & GS_CAN_MODE_LOOP_BACK) != 0U);
     config.enableIndividMask  = false;
     config.disableSelfReception = true;
@@ -91,6 +107,10 @@ status_t CanInitOneWithFlags(can_bus_context_t *bus, uint32_t bitRate, uint32_t 
 
     FLEXCAN_SetTxMbConfig(bus->base, bus->heartbeatMb, true);
     FLEXCAN_SetTxMbConfig(bus->base, bus->shellTxMb, true);
+    for (mbIdx = CAN_GS_TX_MB_FIRST; mbIdx <= CAN_GS_TX_MB_LAST; mbIdx++)
+    {
+        FLEXCAN_SetTxMbConfig(bus->base, mbIdx, true);
+    }
     FLEXCAN_SetRxMbGlobalMask(bus->base, 0U);
 
     rxStdConfig.id     = FLEXCAN_ID_STD(0U);
@@ -103,7 +123,17 @@ status_t CanInitOneWithFlags(can_bus_context_t *bus, uint32_t bitRate, uint32_t 
     rxExtConfig.type   = kFLEXCAN_FrameTypeData;
     FLEXCAN_SetRxMbConfig(bus->base, bus->rxExtMb, &rxExtConfig, true);
 
-    FLEXCAN_ClearMbStatusFlags(bus->base, ((uint64_t)1U << bus->rxStdMb) | ((uint64_t)1U << bus->rxExtMb));
+    rxMask = ((uint64_t)1U << bus->rxStdMb) | ((uint64_t)1U << bus->rxExtMb);
+    FLEXCAN_ClearMbStatusFlags(bus->base, rxMask);
+    CanRxFifoReset((bus->base == CAN2) ? 1U : 0U);
+    GsCanTxQueueReset((bus->base == CAN2) ? 1U : 0U);
+    FLEXCAN_EnableMbInterrupts(bus->base, rxMask);
+    canIrq = CanGetIrqFromBase(bus->base);
+    if (canIrq != NotAvail_IRQn)
+    {
+        NVIC_ClearPendingIRQ(canIrq);
+        EnableIRQ(canIrq);
+    }
 
     bus->txOkCount  = 0U;
     bus->txErrCount = 0U;
@@ -124,6 +154,9 @@ status_t CanInitOneWithFlags(can_bus_context_t *bus, uint32_t bitRate, uint32_t 
 
 status_t CanDeinitOne(can_bus_context_t *bus)
 {
+    IRQn_Type canIrq;
+    uint64_t rxMask;
+
     if (bus == NULL)
     {
         return kStatus_InvalidArgument;
@@ -137,6 +170,17 @@ status_t CanDeinitOne(can_bus_context_t *bus)
     bus->utilRxPermille = 0U;
     bus->utilTotalPermille = 0U;
     bus->utilWindowMs = 0U;
+    rxMask = ((uint64_t)1U << bus->rxStdMb) | ((uint64_t)1U << bus->rxExtMb);
+    FLEXCAN_DisableMbInterrupts(bus->base, rxMask);
+    FLEXCAN_ClearMbStatusFlags(bus->base, rxMask);
+    canIrq = CanGetIrqFromBase(bus->base);
+    if (canIrq != NotAvail_IRQn)
+    {
+        NVIC_ClearPendingIRQ(canIrq);
+        DisableIRQ(canIrq);
+    }
+    CanRxFifoReset((bus->base == CAN2) ? 1U : 0U);
+    GsCanTxQueueReset((bus->base == CAN2) ? 1U : 0U);
     FLEXCAN_Deinit(bus->base);
     return kStatus_Success;
 }
@@ -148,7 +192,7 @@ uint32_t CanEstimateFrameBits(const flexcan_frame_t *frame)
     uint32_t dlc;
     uint32_t rawBits;
 
-    if (frame == NULL)
+    if (APP_UNLIKELY(frame == NULL))
     {
         return 0U;
     }
@@ -268,22 +312,12 @@ void CanResetRuntimeStats(void)
 
 status_t CanWriteTxMbWithRecovery(can_bus_context_t *bus, uint8_t mbIdx, const flexcan_frame_t *frame)
 {
-    status_t status;
-
     if ((bus == NULL) || (frame == NULL))
     {
         return kStatus_InvalidArgument;
     }
 
-    status = FLEXCAN_WriteTxMb(bus->base, mbIdx, frame);
-    if (status == kStatus_FLEXCAN_TxBusy)
-    {
-        /* Recover from a stale pending TX (for example no ACK/bus errors): abort MB and retry once. */
-        FLEXCAN_SetTxMbConfig(bus->base, mbIdx, true);
-        status = FLEXCAN_WriteTxMb(bus->base, mbIdx, frame);
-    }
-
-    return status;
+    return FLEXCAN_WriteTxMb(bus->base, mbIdx, frame);
 }
 
 status_t CanSendFrame(can_bus_context_t *bus, uint8_t mbIdx, uint32_t id, const uint8_t *payload, uint8_t length)
@@ -1079,6 +1113,263 @@ bool CanLogOpenFile(FIL *file, mf4_log_state_t *state)
     return true;
 }
 
+static uint32_t Mf4GetU32(const uint8_t *src)
+{
+    return ((uint32_t)src[0]) | (((uint32_t)src[1]) << 8U) | (((uint32_t)src[2]) << 16U) |
+           (((uint32_t)src[3]) << 24U);
+}
+
+static uint64_t Mf4GetU64(const uint8_t *src)
+{
+    return ((uint64_t)src[0]) | (((uint64_t)src[1]) << 8U) | (((uint64_t)src[2]) << 16U) |
+           (((uint64_t)src[3]) << 24U) | (((uint64_t)src[4]) << 32U) | (((uint64_t)src[5]) << 40U) |
+           (((uint64_t)src[6]) << 48U) | (((uint64_t)src[7]) << 56U);
+}
+
+static bool CanLogU64ToDec(uint64_t value, char *dst, size_t dstSize)
+{
+    char tmp[21];
+    size_t len = 0U;
+    size_t i;
+
+    if ((dst == NULL) || (dstSize < 2U))
+    {
+        return false;
+    }
+
+    do
+    {
+        tmp[len++] = (char)('0' + (value % 10ULL));
+        value /= 10ULL;
+    } while ((value != 0ULL) && (len < sizeof(tmp)));
+
+    if ((len == 0U) || ((len + 1U) > dstSize))
+    {
+        return false;
+    }
+
+    for (i = 0U; i < len; i++)
+    {
+        dst[i] = tmp[len - 1U - i];
+    }
+    dst[len] = '\0';
+    return true;
+}
+
+FRESULT CanLogExportCsv(const char *srcPath, const char *dstPath, uint32_t *recordsWritten)
+{
+    FIL srcFile;
+    FIL dstFile;
+    bool srcOpen = false;
+    bool dstOpen = false;
+    FRESULT fr = FR_INT_ERR;
+    uint8_t magic[8];
+    uint8_t program[8];
+    uint8_t dtHeader[MF4_BLOCK_COMMON_SIZE];
+    uint32_t dtBlockOffset;
+    uint32_t dtDataOffset;
+    uint64_t dataBytes;
+    uint64_t recordCount;
+    uint64_t idx;
+    UINT transferred;
+
+    if (recordsWritten != NULL)
+    {
+        *recordsWritten = 0U;
+    }
+
+    if ((srcPath == NULL) || (dstPath == NULL) || (srcPath[0] == '\0') || (dstPath[0] == '\0'))
+    {
+        return FR_INVALID_PARAMETER;
+    }
+    if (strcmp(srcPath, dstPath) == 0)
+    {
+        return FR_INVALID_PARAMETER;
+    }
+
+    if (!s_fsMounted)
+    {
+        fr = FsMount();
+        if (fr != FR_OK)
+        {
+            return fr;
+        }
+    }
+
+    fr = f_open(&srcFile, srcPath, FA_READ);
+    if (fr != FR_OK)
+    {
+        return fr;
+    }
+    srcOpen = true;
+
+    Mf4ComputeLayout(NULL, &dtBlockOffset, &dtDataOffset);
+    if (f_size(&srcFile) < (FSIZE_t)dtDataOffset)
+    {
+        fr = FR_INVALID_OBJECT;
+        goto cleanup;
+    }
+
+    if (!Mf4ReadAt(&srcFile, MF4_OFFSET_ID, magic, sizeof(magic)) ||
+        !Mf4ReadAt(&srcFile, 16U, program, sizeof(program)))
+    {
+        fr = FR_DISK_ERR;
+        goto cleanup;
+    }
+    if ((memcmp(magic, MF4_ID_BLOCK_MAGIC, sizeof(magic)) != 0) ||
+        (memcmp(program, MF4_PROGRAM_TEXT, sizeof(program)) != 0))
+    {
+        fr = FR_INVALID_OBJECT;
+        goto cleanup;
+    }
+
+    if (!Mf4ReadAt(&srcFile, dtBlockOffset, dtHeader, sizeof(dtHeader)))
+    {
+        fr = FR_DISK_ERR;
+        goto cleanup;
+    }
+    if ((memcmp(&dtHeader[0], "##DT", 4U) != 0) || (Mf4GetU64(&dtHeader[8]) < MF4_BLOCK_COMMON_SIZE))
+    {
+        fr = FR_INVALID_OBJECT;
+        goto cleanup;
+    }
+
+    dataBytes = (uint64_t)f_size(&srcFile) - (uint64_t)dtDataOffset;
+    {
+        uint64_t declaredDataBytes = Mf4GetU64(&dtHeader[8]) - MF4_BLOCK_COMMON_SIZE;
+        if (declaredDataBytes < dataBytes)
+        {
+            dataBytes = declaredDataBytes;
+        }
+    }
+
+    dataBytes -= (dataBytes % (uint64_t)sizeof(can_log_record_t));
+    recordCount = dataBytes / (uint64_t)sizeof(can_log_record_t);
+
+    fr = f_lseek(&srcFile, (FSIZE_t)dtDataOffset);
+    if (fr != FR_OK)
+    {
+        goto cleanup;
+    }
+
+    fr = f_open(&dstFile, dstPath, FA_CREATE_ALWAYS | FA_WRITE);
+    if (fr != FR_OK)
+    {
+        goto cleanup;
+    }
+    dstOpen = true;
+
+    {
+        static const char kHeader[] = "index,timestamp_ns,channel,can_id_hex,is_ext,is_rtr,is_err,dlc,data_hex,flags\r\n";
+        fr = f_write(&dstFile, kHeader, (UINT)(sizeof(kHeader) - 1U), &transferred);
+        if ((fr != FR_OK) || (transferred != (UINT)(sizeof(kHeader) - 1U)))
+        {
+            fr = (fr == FR_OK) ? FR_INT_ERR : fr;
+            goto cleanup;
+        }
+    }
+
+    for (idx = 0U; idx < recordCount; idx++)
+    {
+        can_log_record_t record;
+        uint32_t rawCanId;
+        uint32_t canIdValue;
+        uint8_t dlc;
+        uint8_t dataBytesArray[8];
+        size_t i;
+        char dataHex[17];
+        char idxDec[21];
+        char tsDec[21];
+        size_t hexPos = 0U;
+        char line[192];
+        int32_t lineLen;
+        bool isExtended;
+        bool isRtr;
+        bool isErr;
+
+        fr = f_read(&srcFile, &record, sizeof(record), &transferred);
+        if ((fr != FR_OK) || (transferred != sizeof(record)))
+        {
+            fr = (fr == FR_OK) ? FR_INT_ERR : fr;
+            goto cleanup;
+        }
+
+        dlc = record.dlc;
+        if (dlc > 8U)
+        {
+            dlc = 8U;
+        }
+
+        dataBytesArray[0] = (uint8_t)((record.data64 >> 0U) & 0xFFU);
+        dataBytesArray[1] = (uint8_t)((record.data64 >> 8U) & 0xFFU);
+        dataBytesArray[2] = (uint8_t)((record.data64 >> 16U) & 0xFFU);
+        dataBytesArray[3] = (uint8_t)((record.data64 >> 24U) & 0xFFU);
+        dataBytesArray[4] = (uint8_t)((record.data64 >> 32U) & 0xFFU);
+        dataBytesArray[5] = (uint8_t)((record.data64 >> 40U) & 0xFFU);
+        dataBytesArray[6] = (uint8_t)((record.data64 >> 48U) & 0xFFU);
+        dataBytesArray[7] = (uint8_t)((record.data64 >> 56U) & 0xFFU);
+
+        for (i = 0U; i < dlc; i++)
+        {
+            if ((hexPos + 2U) >= sizeof(dataHex))
+            {
+                break;
+            }
+            (void)snprintf(&dataHex[hexPos], sizeof(dataHex) - hexPos, "%02X", (unsigned int)dataBytesArray[i]);
+            hexPos += 2U;
+        }
+        dataHex[hexPos] = '\0';
+
+        rawCanId = Mf4GetU32((const uint8_t *)&record.canId);
+        isExtended = ((rawCanId & CAN_EFF_FLAG) != 0U);
+        isRtr = ((rawCanId & CAN_RTR_FLAG) != 0U);
+        isErr = ((rawCanId & CAN_ERR_FLAG) != 0U);
+        canIdValue = isExtended ? (rawCanId & CAN_EFF_MASK) : (rawCanId & CAN_SFF_MASK);
+
+        if (!CanLogU64ToDec(idx, idxDec, sizeof(idxDec)) || !CanLogU64ToDec(record.timestampNs, tsDec, sizeof(tsDec)))
+        {
+            fr = FR_INT_ERR;
+            goto cleanup;
+        }
+
+        lineLen = snprintf(line, sizeof(line), "%s,%s,%u,0x%08lX,%u,%u,%u,%u,%s,0x%02X\r\n",
+                           idxDec, tsDec, (unsigned int)record.channel, (unsigned long)canIdValue, isExtended ? 1U : 0U,
+                           isRtr ? 1U : 0U, isErr ? 1U : 0U, (unsigned int)dlc, dataHex,
+                           (unsigned int)record.frameFlags);
+        if ((lineLen <= 0) || ((size_t)lineLen >= sizeof(line)))
+        {
+            fr = FR_INT_ERR;
+            goto cleanup;
+        }
+
+        fr = f_write(&dstFile, line, (UINT)lineLen, &transferred);
+        if ((fr != FR_OK) || (transferred != (UINT)lineLen))
+        {
+            fr = (fr == FR_OK) ? FR_INT_ERR : fr;
+            goto cleanup;
+        }
+
+        if (recordsWritten != NULL)
+        {
+            (*recordsWritten)++;
+        }
+    }
+
+    fr = f_sync(&dstFile);
+
+cleanup:
+    if (dstOpen)
+    {
+        (void)f_close(&dstFile);
+    }
+    if (srcOpen)
+    {
+        (void)f_close(&srcFile);
+    }
+    SdUsageInvalidate();
+    return fr;
+}
+
 bool CanLogEnqueue(size_t busIndex, const flexcan_frame_t *frame, status_t status)
 {
     can_log_record_t record;
@@ -1086,7 +1377,7 @@ bool CanLogEnqueue(size_t busIndex, const flexcan_frame_t *frame, status_t statu
     uint32_t canId;
     uint8_t dlc;
 
-    if ((frame == NULL) || (s_canLogQueue == NULL))
+    if (APP_UNLIKELY((frame == NULL) || (s_canLogQueue == NULL) || !s_logEnabled))
     {
         return false;
     }
@@ -1131,16 +1422,19 @@ bool CanLogEnqueue(size_t busIndex, const flexcan_frame_t *frame, status_t statu
 
 void CanHandleRxFrame(size_t busIndex, const flexcan_frame_t *frame, status_t status)
 {
-    if ((frame == NULL) || (busIndex >= ARRAY_SIZE(s_canBuses)))
+    can_bus_context_t *bus;
+
+    if (APP_UNLIKELY((frame == NULL) || (busIndex >= ARRAY_SIZE(s_canBuses))))
     {
         return;
     }
 
-    s_canBuses[busIndex].rxOkCount++;
-    s_canBuses[busIndex].rxBitCount += CanEstimateFrameBits(frame);
-    if (status == kStatus_FLEXCAN_RxOverflow)
+    bus = &s_canBuses[busIndex];
+    bus->rxOkCount++;
+    bus->rxBitCount += CanEstimateFrameBits(frame);
+    if (APP_UNLIKELY(status == kStatus_FLEXCAN_RxOverflow))
     {
-        s_canBuses[busIndex].rxOverflowCount++;
+        bus->rxOverflowCount++;
     }
 
     if (s_canDumpEnabled)
@@ -1150,9 +1444,15 @@ void CanHandleRxFrame(size_t busIndex, const flexcan_frame_t *frame, status_t st
 
     LedMarkCanActivity();
 
-    if (s_gsCanConfigured && s_canBuses[busIndex].started && !GsCanRxPublish(busIndex, frame, status))
+    if (APP_LIKELY(s_gsCanConfigured && bus->started))
     {
-        GsCanSetOverflowFlag(busIndex);
+        if (APP_UNLIKELY(!GsCanRxPublish(busIndex, frame, status)))
+        {
+            GsCanSetOverflowFlag(busIndex);
+        }
     }
-    (void)CanLogEnqueue(busIndex, frame, status);
+    if (APP_UNLIKELY(s_logEnabled))
+    {
+        (void)CanLogEnqueue(busIndex, frame, status);
+    }
 }

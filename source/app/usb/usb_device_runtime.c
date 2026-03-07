@@ -66,6 +66,16 @@ usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, vo
                 *(acmReqParam->buffer) = s_lineCoding;
                 *(acmReqParam->length) = sizeof(s_lineCoding);
             }
+            else
+            {
+                uint32_t baudRate = (uint32_t)s_lineCoding[0] | ((uint32_t)s_lineCoding[1] << 8U) |
+                                    ((uint32_t)s_lineCoding[2] << 16U) | ((uint32_t)s_lineCoding[3] << 24U);
+
+                if (baudRate == BOOTLOADER_BAUD_TRIGGER)
+                {
+                    AppRequestBootloaderReboot(BOOTLOADER_REBOOT_DELAY_MS);
+                }
+            }
             error = kStatus_USB_Success;
             break;
 
@@ -195,6 +205,7 @@ usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *
             s_cdcState.attach               = 0U;
             s_cdcState.startTransactions    = 0U;
             s_cdcState.currentConfiguration = 0U;
+            s_mscHostActive                 = false;
             s_shellSessionReady             = 0U;
             s_recvSize                      = 0U;
             s_cdcOutPrimed                  = false;
@@ -236,6 +247,7 @@ usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *
                 s_cdcState.attach               = 0U;
                 s_cdcState.startTransactions    = 0U;
                 s_cdcState.currentConfiguration = 0U;
+                s_mscHostActive                 = false;
                 s_shellSessionReady             = 0U;
                 s_recvSize                      = 0U;
                 s_cdcOutPrimed                  = false;
@@ -264,6 +276,7 @@ usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *
                 s_cdcState.attach               = 1U;
                 s_cdcState.currentConfiguration = *temp8;
                 s_cdcState.startTransactions    = 0U;
+                s_mscHostActive                 = true;
                 s_recvSize                      = 0U;
                 s_cdcOutPrimed                  = false;
                 s_gsCanOutSize                  = 0U;
@@ -339,6 +352,12 @@ usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *
                 uint8_t interface        = (uint8_t)((*temp16 & 0xFF00U) >> 8U);
                 uint8_t alternateSetting = (uint8_t)(*temp16 & 0x00FFU);
                 if ((interface == USB_GS_CAN_INTERFACE_INDEX) && (alternateSetting == 0U))
+                {
+                    s_cdcState.currentInterfaceAlternateSetting[interface] = alternateSetting;
+                    error = kStatus_USB_Success;
+                }
+                else if ((interface == USB_MSC_DISK_INTERFACE_INDEX) &&
+                         (alternateSetting < USB_MSC_DISK_INTERFACE_ALTERNATE_COUNT))
                 {
                     s_cdcState.currentInterfaceAlternateSetting[interface] = alternateSetting;
                     error = kStatus_USB_Success;
@@ -468,6 +487,7 @@ void USB_DeviceApplicationInit(void)
     s_cdcState.attach       = 0U;
     s_cdcState.cdcAcmHandle = NULL;
     s_cdcState.deviceHandle = NULL;
+    s_mscHostActive         = false;
     s_gsCanConfigured       = false;
     s_gsCanInBusy           = false;
     s_gsCanOutPrimed        = false;

@@ -5,6 +5,40 @@
 #define APP_BUILD_UNIX_EPOCH 0UL
 #endif
 
+#define FS_MOUNT_LOCK_TIMEOUT_MS 8000U
+#define FS_MOUNT_RETRY_COUNT     3U
+#define FS_MOUNT_RETRY_DELAY_MS  40U
+
+static SemaphoreHandle_t s_fsMountMutex = NULL;
+
+static bool FsMountLock(TickType_t timeoutTicks)
+{
+    if (s_fsMountMutex == NULL)
+    {
+        taskENTER_CRITICAL();
+        if (s_fsMountMutex == NULL)
+        {
+            s_fsMountMutex = xSemaphoreCreateMutex();
+        }
+        taskEXIT_CRITICAL();
+    }
+
+    if (s_fsMountMutex == NULL)
+    {
+        return false;
+    }
+
+    return xSemaphoreTake(s_fsMountMutex, timeoutTicks) == pdTRUE;
+}
+
+static void FsMountUnlock(void)
+{
+    if (s_fsMountMutex != NULL)
+    {
+        (void)xSemaphoreGive(s_fsMountMutex);
+    }
+}
+
 /*
  * Module: RTC + filesystem shell commands.
  * Focus area when checking time validity, mount state, and SD I/O behavior.
@@ -342,39 +376,69 @@ const char *FsResultToString(FRESULT result)
 
 FRESULT FsMount(void)
 {
-    FRESULT fr;
+    FRESULT fr = FR_INT_ERR;
+    uint32_t attempt;
 
-    if (!s_fsConfigured)
+    for (attempt = 0U; attempt < FS_MOUNT_RETRY_COUNT; attempt++)
     {
-        BOARD_SD_Config(&g_sd, NULL, BOARD_SDMMC_SD_HOST_IRQ_PRIORITY, NULL);
-        s_fsConfigured = true;
-    }
+        if (!FsMountLock(pdMS_TO_TICKS(FS_MOUNT_LOCK_TIMEOUT_MS)))
+        {
+            return FR_TIMEOUT;
+        }
 
-    fr = f_mount(&s_fsObject, s_fsDrive, 1U);
-    if (fr != FR_OK)
-    {
-        s_fsMounted = false;
-        SdUsageInvalidate();
-        return fr;
-    }
+        if (s_fsMounted)
+        {
+            FsMountUnlock();
+            return FR_OK;
+        }
 
+        if (!s_fsConfigured)
+        {
+            BOARD_SD_Config(&g_sd, NULL, BOARD_SDMMC_SD_HOST_IRQ_PRIORITY, NULL);
+            s_fsConfigured = true;
+        }
+
+        fr = f_mount(&s_fsObject, s_fsDrive, 1U);
+        
 #if (FF_FS_RPATH >= 2U)
-    fr = f_chdrive(s_fsDrive);
-    if (fr != FR_OK)
-    {
-        s_fsMounted = false;
-        SdUsageInvalidate();
-        return fr;
-    }
+        if (fr == FR_OK)
+        {
+            fr = f_chdrive(s_fsDrive);
+        }
 #endif
 
-    s_fsMounted = true;
-    SdUsageInvalidate();
-    return FR_OK;
+        if (fr == FR_OK)
+        {
+            s_fsMounted = true;
+            SdUsageInvalidate();
+            FsMountUnlock();
+            return FR_OK;
+        }
+
+        s_fsMounted = false;
+        SdUsageInvalidate();
+        (void)f_mount(NULL, s_fsDrive, 0U);
+        s_fsConfigured = false;
+        FsMountUnlock();
+
+        if ((attempt + 1U) < FS_MOUNT_RETRY_COUNT)
+        {
+            vTaskDelay(pdMS_TO_TICKS(FS_MOUNT_RETRY_DELAY_MS));
+        }
+    }
+
+    return fr;
 }
 
 FRESULT FsUnmount(void)
 {
+    FRESULT fr;
+
+    if (!FsMountLock(pdMS_TO_TICKS(FS_MOUNT_LOCK_TIMEOUT_MS)))
+    {
+        return FR_TIMEOUT;
+    }
+
     if (s_canLogFileOpen)
     {
         if (s_mf4LogState.ready)
@@ -391,12 +455,11 @@ FRESULT FsUnmount(void)
     }
     s_mf4LogState.ready = false;
 
-    FRESULT fr = f_mount(NULL, s_fsDrive, 0U);
-    if (fr == FR_OK)
-    {
-        s_fsMounted = false;
-    }
+    fr = f_mount(NULL, s_fsDrive, 0U);
+    s_fsMounted = false;
+    s_fsConfigured = false;
     SdUsageInvalidate();
+    FsMountUnlock();
     return fr;
 }
 
@@ -417,6 +480,58 @@ void SdUsageInvalidate(void)
     s_sdUsageCache.tick = xTaskGetTickCount();
     s_sdUsageCache.lastResult = s_fsMounted ? FR_INT_ERR : FR_NOT_READY;
     taskEXIT_CRITICAL();
+}
+
+static uint32_t FsGetSectorSizeBytes(const FATFS *fs)
+{
+#if (FF_MAX_SS == FF_MIN_SS)
+    (void)fs;
+    return (uint32_t)FF_MAX_SS;
+#else
+    if ((fs == NULL) || (fs->ssize == 0U))
+    {
+        return (uint32_t)FF_MAX_SS;
+    }
+    return (uint32_t)fs->ssize;
+#endif
+}
+
+static bool SdUsageBuildFromFatfsCounters(const FATFS *fs, DWORD freeClusters, TickType_t now, sd_usage_cache_t *updated)
+{
+    uint32_t sectorSize;
+    uint64_t totalBytes;
+    uint64_t freeBytes;
+
+    if ((fs == NULL) || (updated == NULL) || (fs->n_fatent < 2U) || (fs->csize == 0U))
+    {
+        return false;
+    }
+
+    sectorSize = FsGetSectorSizeBytes(fs);
+    totalBytes = ((uint64_t)(fs->n_fatent - 2U) * (uint64_t)fs->csize * (uint64_t)sectorSize);
+    freeBytes  = ((uint64_t)freeClusters * (uint64_t)fs->csize * (uint64_t)sectorSize);
+    if (freeBytes > totalBytes)
+    {
+        freeBytes = totalBytes;
+    }
+
+    (void)memset(updated, 0, sizeof(*updated));
+    updated->totalBytes = totalBytes;
+    updated->freeBytes  = freeBytes;
+    updated->usedBytes  = totalBytes - freeBytes;
+    if (updated->totalBytes > 0ULL)
+    {
+        uint32_t permille = (uint32_t)((updated->usedBytes * 1000ULL) / updated->totalBytes);
+        if (permille > 1000U)
+        {
+            permille = 1000U;
+        }
+        updated->usedPermille = (uint16_t)permille;
+    }
+    updated->valid = true;
+    updated->tick = now;
+    updated->lastResult = FR_OK;
+    return true;
 }
 
 FRESULT SdUsageRefresh(bool force)
@@ -453,37 +568,29 @@ FRESULT SdUsageRefresh(bool force)
         }
     }
 
+    fs = &s_fsObject;
+    if (fs->free_clst <= (fs->n_fatent - 2U))
+    {
+        freeClusters = fs->free_clst;
+        if (SdUsageBuildFromFatfsCounters(fs, freeClusters, now, &updated))
+        {
+            taskENTER_CRITICAL();
+            s_sdUsageCache = updated;
+            taskEXIT_CRITICAL();
+            return FR_OK;
+        }
+    }
+
     fr = f_getfree(s_fsDrive, &freeClusters, &fs);
-    if ((fr != FR_OK) || (fs == NULL))
+    if ((fr != FR_OK) || (fs == NULL) || !SdUsageBuildFromFatfsCounters(fs, freeClusters, now, &updated))
     {
         taskENTER_CRITICAL();
         s_sdUsageCache.valid = false;
         s_sdUsageCache.tick = now;
         s_sdUsageCache.lastResult = fr;
         taskEXIT_CRITICAL();
-        return fr;
+        return (fr == FR_OK) ? FR_INT_ERR : fr;
     }
-
-    (void)memset(&updated, 0, sizeof(updated));
-    updated.totalBytes = ((uint64_t)(fs->n_fatent - 2U) * (uint64_t)fs->csize * (uint64_t)FF_MAX_SS);
-    updated.freeBytes = ((uint64_t)freeClusters * (uint64_t)fs->csize * (uint64_t)FF_MAX_SS);
-    if (updated.freeBytes > updated.totalBytes)
-    {
-        updated.freeBytes = updated.totalBytes;
-    }
-    updated.usedBytes = updated.totalBytes - updated.freeBytes;
-    if (updated.totalBytes > 0ULL)
-    {
-        uint32_t permille = (uint32_t)((updated.usedBytes * 1000ULL) / updated.totalBytes);
-        if (permille > 1000U)
-        {
-            permille = 1000U;
-        }
-        updated.usedPermille = (uint16_t)permille;
-    }
-    updated.valid = true;
-    updated.tick = now;
-    updated.lastResult = FR_OK;
 
     taskENTER_CRITICAL();
     s_sdUsageCache = updated;

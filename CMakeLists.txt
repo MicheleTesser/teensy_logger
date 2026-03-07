@@ -29,6 +29,7 @@ set(PROJECT_SOURCES
   source/app/core/app_tasks.c
   source/app/usb/usb_shell.c
   source/app/usb/usb_device_runtime.c
+  source/app/usb/usb_msc_disk.c
   source/app/storage/rtc_fs.c
   source/app/can/can_core_mf4.c
   source/app/can/can_shell_gs.c
@@ -61,6 +62,8 @@ set(PROJECT_SOURCES
   middleware/usb/device/usb_device_ehci.c
   middleware/usb/device/class/usb_device_class.c
   middleware/usb/device/class/usb_device_cdc_acm.c
+  middleware/usb/device/class/usb_device_msc.c
+  middleware/usb/device/class/usb_device_msc_ufi.c
   middleware/usb/phy/usb_phy.c
 
   ${FATFS_DIR}/source/ff.c
@@ -161,7 +164,7 @@ target_compile_options(${PROJECT_TARGET}
     -Wno-unused-parameter
     -Wno-cast-function-type
     $<$<CONFIG:Debug>:-Og;-g3>
-    $<$<CONFIG:Release>:-O2>
+    $<$<CONFIG:Release>:-O3;-flto>
 )
 
 target_link_options(${PROJECT_TARGET}
@@ -171,6 +174,7 @@ target_link_options(${PROJECT_TARGET}
     "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-$<LOWER_CASE:$<CONFIG>>.map"
     -Wl,--gc-sections
     -Wl,--print-memory-usage
+    $<$<CONFIG:Release>:-flto;-Wl,-O2>
     -specs=nano.specs
     -specs=nosys.specs
 )

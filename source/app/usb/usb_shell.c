@@ -1,4 +1,11 @@
 #include "app/app_shared.h"
+#include "build_epoch.h"
+
+#ifndef APP_BUILD_UNIX_EPOCH
+#define APP_BUILD_UNIX_EPOCH 0UL
+#endif
+
+#define RTC_MIN_VALID_EPOCH 1577836800UL
 
 static const CLI_Command_Definition_t s_cliHelpCommand = {
     .pcCommand = "help",
@@ -23,14 +30,14 @@ static const CLI_Command_Definition_t s_cliCanCommand = {
 
 static const CLI_Command_Definition_t s_cliLogCommand = {
     .pcCommand = "log",
-    .pcHelpString = "log <status|on|off|usb <on|off>|autocan <on|off>>\r\n",
+    .pcHelpString = "log <status|on|off|usb <on|off>|autocan <on|off>|export ...>\r\n",
     .pxCommandInterpreter = ShellCliLogCommand,
     .cExpectedNumberOfParameters = -1,
 };
 
 static const CLI_Command_Definition_t s_cliSdCommand = {
     .pcCommand = "sd",
-    .pcHelpString = "sd <status|refresh>: stato spazio SD (cache)\r\n",
+    .pcHelpString = "sd <status|refresh|ls [path] [max]>: stato spazio SD + listing\r\n",
     .pxCommandInterpreter = ShellCliSdCommand,
     .cExpectedNumberOfParameters = -1,
 };
@@ -44,8 +51,15 @@ static const CLI_Command_Definition_t s_cliRtcCommand = {
 
 static const CLI_Command_Definition_t s_cliTimeCommand = {
     .pcCommand = "time",
-    .pcHelpString = "time [<unix_epoch>|status|set <unix_epoch>]\r\n",
+    .pcHelpString = "time [status|set [unix_epoch]|<unix_epoch>] (set senza arg: epoch build host)\r\n",
     .pxCommandInterpreter = ShellCliTimeCommand,
+    .cExpectedNumberOfParameters = -1,
+};
+
+static const CLI_Command_Definition_t s_cliBootCommand = {
+    .pcCommand = "bootloader",
+    .pcHelpString = "bootloader <status|go|cancel>\r\n",
+    .pxCommandInterpreter = ShellCliBootCommand,
     .cExpectedNumberOfParameters = -1,
 };
 
@@ -239,6 +253,416 @@ bool ShellTokenEquals(const char *token, BaseType_t tokenLen, const char *value)
     return ((size_t)tokenLen == valueLen) && (strncmp(token, value, valueLen) == 0);
 }
 
+static bool ShellCopyParameter(const char *pcCommandString, UBaseType_t index, char *buffer, size_t bufferSize)
+{
+    const char *param;
+    BaseType_t paramLen = 0;
+
+    if ((pcCommandString == NULL) || (buffer == NULL) || (bufferSize < 2U))
+    {
+        return false;
+    }
+
+    param = FreeRTOS_CLIGetParameter(pcCommandString, index, &paramLen);
+    if ((param == NULL) || (paramLen <= 0) || ((size_t)paramLen >= bufferSize))
+    {
+        return false;
+    }
+
+    (void)memcpy(buffer, param, (size_t)paramLen);
+    buffer[paramLen] = '\0';
+    return true;
+}
+
+static bool ShellPathHasMf4Extension(const char *path)
+{
+    const char *dot;
+    const char *slash;
+
+    if (path == NULL)
+    {
+        return false;
+    }
+
+    dot = strrchr(path, '.');
+    if (dot == NULL)
+    {
+        return false;
+    }
+
+    slash = strrchr(path, '/');
+    if ((slash != NULL) && (dot < slash))
+    {
+        return false;
+    }
+
+    if (dot[1] == '\0')
+    {
+        return false;
+    }
+
+    return (tolower((unsigned char)dot[1]) == 'm') && (tolower((unsigned char)dot[2]) == 'f') &&
+           (tolower((unsigned char)dot[3]) == '4') && (dot[4] == '\0');
+}
+
+static FRESULT ShellEnsureSdMountedForCli(void)
+{
+    FRESULT fr;
+
+    if (s_mscHostActive && (s_cdcState.attach == 1U))
+    {
+        return FR_LOCKED;
+    }
+
+    if (s_fsMounted)
+    {
+        return FR_OK;
+    }
+
+    fr = FsMount();
+    if (fr == FR_OK)
+    {
+        return FR_OK;
+    }
+
+    /* Recovery path: if mount is busy/timed out, pause logger and retry once. */
+    if (fr == FR_TIMEOUT)
+    {
+        bool resumeLogging = s_logEnabled;
+        TickType_t startTick = xTaskGetTickCount();
+        s_logEnabled = false;
+
+        while (s_canLogFileOpen && ((xTaskGetTickCount() - startTick) < pdMS_TO_TICKS(600U)))
+        {
+            vTaskDelay(pdMS_TO_TICKS(20U));
+        }
+
+        (void)FsUnmount();
+        vTaskDelay(pdMS_TO_TICKS(30U));
+        fr = FsMount();
+        s_logEnabled = resumeLogging;
+    }
+
+    return fr;
+}
+
+static bool ShellBuildDefaultCsvPath(const char *srcPath, char *dstPath, size_t dstPathSize)
+{
+    size_t baseLen;
+
+    if ((srcPath == NULL) || (dstPath == NULL) || (dstPathSize < 6U))
+    {
+        return false;
+    }
+
+    baseLen = strlen(srcPath);
+    if (ShellPathHasMf4Extension(srcPath))
+    {
+        const char *dot = strrchr(srcPath, '.');
+        if (dot != NULL)
+        {
+            baseLen = (size_t)(dot - srcPath);
+        }
+    }
+
+    if ((baseLen + 5U) > dstPathSize)
+    {
+        return false;
+    }
+
+    (void)memcpy(dstPath, srcPath, baseLen);
+    (void)memcpy(&dstPath[baseLen], ".csv", 5U);
+    return true;
+}
+
+static bool ShellPauseLoggingForExport(uint32_t timeoutMs)
+{
+    TickType_t startTick = xTaskGetTickCount();
+    TickType_t timeoutTicks = pdMS_TO_TICKS(timeoutMs);
+    uint32_t guard = 0U;
+    const uint32_t guardMax = 1000U;
+
+    s_logEnabled = false;
+    while (s_canLogFileOpen)
+    {
+        if ((xTaskGetTickCount() - startTick) > timeoutTicks)
+        {
+            return false;
+        }
+        if (guard++ > guardMax)
+        {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20U));
+    }
+    return true;
+}
+
+static void ShellFormatBytesHuman(uint64_t bytes, char *out, size_t outSize)
+{
+    static const char *kUnits[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    uint64_t scaled10;
+    size_t unit = 0U;
+    uint32_t whole;
+    uint32_t frac;
+
+    if ((out == NULL) || (outSize == 0U))
+    {
+        return;
+    }
+
+    scaled10 = bytes * 10ULL;
+    while ((scaled10 >= 10240ULL) && (unit < (ARRAY_SIZE(kUnits) - 1U)))
+    {
+        scaled10 = (scaled10 + 512ULL) / 1024ULL;
+        unit++;
+    }
+
+    whole = (uint32_t)(scaled10 / 10ULL);
+    frac  = (uint32_t)(scaled10 % 10ULL);
+
+    if (unit == 0U)
+    {
+        (void)snprintf(out, outSize, "%lu %s", (unsigned long)whole, kUnits[unit]);
+    }
+    else
+    {
+        (void)snprintf(out, outSize, "%lu.%lu %s", (unsigned long)whole, (unsigned long)frac, kUnits[unit]);
+    }
+}
+
+typedef struct
+{
+    uint32_t scanned;
+    uint32_t exported;
+    uint32_t skippedExistingCsv;
+    uint32_t skippedByAge;
+    uint32_t failed;
+    uint32_t recordsExported;
+} shell_export_stats_t;
+
+static bool ShellJoinPath(const char *dirPath, const char *fileName, char *fullPath, size_t fullPathSize)
+{
+    size_t dirLen;
+    bool addSlash;
+    int32_t n;
+
+    if ((dirPath == NULL) || (fileName == NULL) || (fullPath == NULL) || (fullPathSize == 0U))
+    {
+        return false;
+    }
+
+    dirLen = strlen(dirPath);
+    addSlash = (dirLen > 0U) && (dirPath[dirLen - 1U] != '/');
+
+    if ((dirLen == 0U) || ((dirLen == 1U) && (dirPath[0] == '.')))
+    {
+        n = snprintf(fullPath, fullPathSize, "%s", fileName);
+    }
+    else if ((dirLen == 1U) && (dirPath[0] == '/'))
+    {
+        n = snprintf(fullPath, fullPathSize, "/%s", fileName);
+    }
+    else if (addSlash)
+    {
+        n = snprintf(fullPath, fullPathSize, "%s/%s", dirPath, fileName);
+    }
+    else
+    {
+        n = snprintf(fullPath, fullPathSize, "%s%s", dirPath, fileName);
+    }
+
+    return (n > 0) && ((size_t)n < fullPathSize);
+}
+
+static bool ShellIsLeapYear(uint32_t year)
+{
+    return ((year % 4U) == 0U) && (((year % 100U) != 0U) || ((year % 400U) == 0U));
+}
+
+static bool ShellFatDateTimeToUnix(uint16_t fatDate, uint16_t fatTime, uint32_t *unixSeconds)
+{
+    static const uint8_t kDaysInMonth[12] = {31U, 28U, 31U, 30U, 31U, 30U, 31U, 31U, 30U, 31U, 30U, 31U};
+    uint32_t year;
+    uint32_t month;
+    uint32_t day;
+    uint32_t hour;
+    uint32_t minute;
+    uint32_t second;
+    uint64_t days = 0U;
+    uint32_t y;
+    uint32_t m;
+
+    if (unixSeconds == NULL)
+    {
+        return false;
+    }
+
+    year   = 1980U + ((uint32_t)((fatDate >> 9U) & 0x7FU));
+    month  = (uint32_t)((fatDate >> 5U) & 0x0FU);
+    day    = (uint32_t)(fatDate & 0x1FU);
+    hour   = (uint32_t)((fatTime >> 11U) & 0x1FU);
+    minute = (uint32_t)((fatTime >> 5U) & 0x3FU);
+    second = (uint32_t)(fatTime & 0x1FU) * 2U;
+
+    if ((month < 1U) || (month > 12U) || (day < 1U) || (hour > 23U) || (minute > 59U) || (second > 59U))
+    {
+        return false;
+    }
+
+    if (day > kDaysInMonth[month - 1U] + ((month == 2U && ShellIsLeapYear(year)) ? 1U : 0U))
+    {
+        return false;
+    }
+
+    for (y = 1970U; y < year; y++)
+    {
+        days += ShellIsLeapYear(y) ? 366ULL : 365ULL;
+    }
+    for (m = 1U; m < month; m++)
+    {
+        days += kDaysInMonth[m - 1U];
+        if ((m == 2U) && ShellIsLeapYear(year))
+        {
+            days++;
+        }
+    }
+    days += (uint64_t)(day - 1U);
+
+    *unixSeconds = (uint32_t)(days * 86400ULL + ((uint64_t)hour * 3600ULL) + ((uint64_t)minute * 60ULL) + second);
+    return true;
+}
+
+static FRESULT ShellExportIncremental(const char *dirPath, bool filterRecent, uint32_t recentMinutes,
+                                      shell_export_stats_t *stats)
+{
+    DIR dir;
+    FILINFO info;
+    FRESULT fr;
+    FRESULT firstError = FR_OK;
+    const char *effectiveDirPath = dirPath;
+    uint32_t nowSeconds = 0U;
+    uint32_t ageLimitSeconds = 0U;
+
+    if ((dirPath == NULL) || (stats == NULL))
+    {
+        return FR_INVALID_PARAMETER;
+    }
+
+    (void)memset(stats, 0, sizeof(*stats));
+
+    if (filterRecent)
+    {
+        if (!RtcIsValid())
+        {
+            return FR_INVALID_PARAMETER;
+        }
+        nowSeconds = RtcGetUnixSeconds();
+        ageLimitSeconds = recentMinutes * 60U;
+    }
+
+    fr = f_opendir(&dir, dirPath);
+    if ((fr != FR_OK) && (strcmp(dirPath, ".") == 0))
+    {
+        fr = f_opendir(&dir, "/");
+        if (fr == FR_OK)
+        {
+            effectiveDirPath = "/";
+        }
+    }
+    if (fr != FR_OK)
+    {
+        return fr;
+    }
+
+    while (true)
+    {
+        const char *name;
+        char srcPath[CAN_LOG_EXPORT_PATH_MAX];
+        char dstPath[CAN_LOG_EXPORT_PATH_MAX];
+        uint32_t exportedRecords = 0U;
+        FILINFO csvInfo;
+        uint32_t fileSeconds = 0U;
+
+        fr = f_readdir(&dir, &info);
+        if (fr != FR_OK)
+        {
+            firstError = (firstError == FR_OK) ? fr : firstError;
+            break;
+        }
+        if (info.fname[0] == '\0')
+        {
+            break;
+        }
+        if ((info.fattrib & AM_DIR) != 0U)
+        {
+            continue;
+        }
+
+        name = info.fname;
+        if (!ShellPathHasMf4Extension(name))
+        {
+            continue;
+        }
+
+        stats->scanned++;
+
+        if (filterRecent)
+        {
+            if (!ShellFatDateTimeToUnix(info.fdate, info.ftime, &fileSeconds))
+            {
+                stats->skippedByAge++;
+                continue;
+            }
+            if ((nowSeconds > fileSeconds) && ((nowSeconds - fileSeconds) > ageLimitSeconds))
+            {
+                stats->skippedByAge++;
+                continue;
+            }
+        }
+
+        if (!ShellJoinPath(effectiveDirPath, name, srcPath, sizeof(srcPath)))
+        {
+            stats->failed++;
+            firstError = (firstError == FR_OK) ? FR_INVALID_NAME : firstError;
+            continue;
+        }
+        if (!ShellBuildDefaultCsvPath(srcPath, dstPath, sizeof(dstPath)))
+        {
+            stats->failed++;
+            firstError = (firstError == FR_OK) ? FR_INVALID_NAME : firstError;
+            continue;
+        }
+
+        fr = f_stat(dstPath, &csvInfo);
+        if (fr == FR_OK)
+        {
+            stats->skippedExistingCsv++;
+            continue;
+        }
+        if ((fr != FR_NO_FILE) && (fr != FR_NO_PATH))
+        {
+            stats->failed++;
+            firstError = (firstError == FR_OK) ? fr : firstError;
+            continue;
+        }
+
+        fr = CanLogExportCsv(srcPath, dstPath, &exportedRecords);
+        if (fr != FR_OK)
+        {
+            stats->failed++;
+            firstError = (firstError == FR_OK) ? fr : firstError;
+            continue;
+        }
+
+        stats->exported++;
+        stats->recordsExported += exportedRecords;
+    }
+
+    (void)f_closedir(&dir);
+    return firstError;
+}
+
 void ShellCliInit(void)
 {
     if (s_shellCliReady)
@@ -274,6 +698,10 @@ void ShellCliInit(void)
     {
         return;
     }
+    if (FreeRTOS_CLIRegisterCommand(&s_cliBootCommand) != pdTRUE)
+    {
+        return;
+    }
 
     s_shellCliReady = true;
 }
@@ -286,11 +714,16 @@ BaseType_t ShellCliHelpCommand(char *pcWriteBuffer, size_t xWriteBufferLen, cons
                    "  help                 - mostra questo help\r\n"
                    "  led <status|activity|on|off>\r\n"
                    "  can <status|util|clear>\r\n"
-                   "  log <status|on|off|usb <on|off>|autocan <on|off>>\r\n"
-                   "  sd <status|refresh>  - spazio SD totale/libero/usato\r\n"
+                   "  log <status|on|off|usb <on|off>|autocan <on|off>|export ...>\r\n"
+                   "    log export <src|active> [dst.csv]\r\n"
+                   "    log export inc [dir]             - solo file .mf4 senza .csv\r\n"
+                   "    log export recent [min] [dir]    - default 60 min\r\n"
+                   "  sd <status|refresh|ls [path] [max]>  - spazio SD + list file\r\n"
                    "  rtc status           - stato RTC SNVS (UTC)\r\n"
                    "  rtc set <epoch>      - imposta RTC con Unix epoch\r\n"
                    "  time [epoch]          - alias rapido per leggere/impostare RTC\r\n"
+                   "  time set              - usa epoch host al momento della build\r\n"
+                   "  bootloader <status|go|cancel> - entra in bootloader per flash\r\n"
                    "Nota: CAN init/send solo via SocketCAN.\r\n");
     return pdFALSE;
 }
@@ -500,20 +933,197 @@ BaseType_t ShellCliLogCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const
         return pdFALSE;
     }
 
-    (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: log <status|on|off|usb <on|off>|autocan <on|off>>\r\n");
+    if (ShellTokenEquals(subcmd, subcmdLen, "export"))
+    {
+        char srcPath[CAN_LOG_EXPORT_PATH_MAX];
+        char dstPath[CAN_LOG_EXPORT_PATH_MAX];
+        char argPath[CAN_LOG_EXPORT_PATH_MAX];
+        char dirPath[CAN_LOG_EXPORT_PATH_MAX];
+        shell_export_stats_t stats;
+        bool resumeLogging = s_logEnabled;
+        uint32_t recentMinutes = 60U;
+        uint32_t exported = 0U;
+        FRESULT fr;
+
+        if (!ShellCopyParameter(pcCommandString, 2U, argPath, sizeof(argPath)))
+        {
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                           "Uso: log export <src|active> [dst.csv]\r\n"
+                           "     log export inc [dir]\r\n"
+                           "     log export recent [min] [dir]\r\n");
+            return pdFALSE;
+        }
+
+        if (strcmp(argPath, "inc") == 0)
+        {
+            if (!ShellCopyParameter(pcCommandString, 3U, dirPath, sizeof(dirPath)))
+            {
+                (void)strncpy(dirPath, ".", sizeof(dirPath) - 1U);
+                dirPath[sizeof(dirPath) - 1U] = '\0';
+            }
+
+            if (!ShellPauseLoggingForExport(4000U))
+            {
+                s_logEnabled = resumeLogging;
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Timeout chiusura log attivo\r\n");
+                return pdFALSE;
+            }
+
+            fr = ShellExportIncremental(dirPath, false, 0U, &stats);
+            s_logEnabled = resumeLogging;
+
+            if ((fr != FR_OK) && (stats.exported == 0U))
+            {
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Export incrementale fallito: %s (%d)\r\n",
+                               FsResultToString(fr), (int)fr);
+                return pdFALSE;
+            }
+
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                           "Export inc dir=%s scanned=%lu exported=%lu skipped_csv=%lu failed=%lu records=%lu\r\n",
+                           dirPath, (unsigned long)stats.scanned, (unsigned long)stats.exported,
+                           (unsigned long)stats.skippedExistingCsv, (unsigned long)stats.failed,
+                           (unsigned long)stats.recordsExported);
+            return pdFALSE;
+        }
+
+        if (strcmp(argPath, "recent") == 0)
+        {
+            char token[24];
+
+            if (ShellCopyParameter(pcCommandString, 3U, token, sizeof(token)))
+            {
+                if (ShellParseU32Auto(token, &recentMinutes))
+                {
+                    if (!ShellCopyParameter(pcCommandString, 4U, dirPath, sizeof(dirPath)))
+                    {
+                        (void)strncpy(dirPath, ".", sizeof(dirPath) - 1U);
+                        dirPath[sizeof(dirPath) - 1U] = '\0';
+                    }
+                }
+                else
+                {
+                    (void)strncpy(dirPath, token, sizeof(dirPath) - 1U);
+                    dirPath[sizeof(dirPath) - 1U] = '\0';
+                }
+            }
+            else
+            {
+                (void)strncpy(dirPath, ".", sizeof(dirPath) - 1U);
+                dirPath[sizeof(dirPath) - 1U] = '\0';
+            }
+
+            if ((recentMinutes == 0U) || (recentMinutes > (24U * 60U * 30U)))
+            {
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Minuti non validi (1..43200)\r\n");
+                return pdFALSE;
+            }
+
+            if (!RtcIsValid())
+            {
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                               "RTC non valido: usa 'time set <epoch>' prima di 'log export recent'\r\n");
+                return pdFALSE;
+            }
+
+            if (!ShellPauseLoggingForExport(4000U))
+            {
+                s_logEnabled = resumeLogging;
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Timeout chiusura log attivo\r\n");
+                return pdFALSE;
+            }
+
+            fr = ShellExportIncremental(dirPath, true, recentMinutes, &stats);
+            s_logEnabled = resumeLogging;
+
+            if ((fr != FR_OK) && (stats.exported == 0U))
+            {
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Export recent fallito: %s (%d)\r\n",
+                               FsResultToString(fr), (int)fr);
+                return pdFALSE;
+            }
+
+            (void)snprintf(
+                pcWriteBuffer, xWriteBufferLen,
+                "Export recent=%lu min dir=%s scanned=%lu exported=%lu skipped_csv=%lu skipped_age=%lu failed=%lu records=%lu\r\n",
+                (unsigned long)recentMinutes, dirPath, (unsigned long)stats.scanned, (unsigned long)stats.exported,
+                (unsigned long)stats.skippedExistingCsv, (unsigned long)stats.skippedByAge,
+                (unsigned long)stats.failed, (unsigned long)stats.recordsExported);
+            return pdFALSE;
+        }
+
+        if (strcmp(argPath, "active") == 0)
+        {
+            if (s_canLogActivePath[0] == '\0')
+            {
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Nessun log attivo. Specifica un file sorgente.\r\n");
+                return pdFALSE;
+            }
+            (void)strncpy(srcPath, s_canLogActivePath, sizeof(srcPath) - 1U);
+            srcPath[sizeof(srcPath) - 1U] = '\0';
+        }
+        else
+        {
+            (void)strncpy(srcPath, argPath, sizeof(srcPath) - 1U);
+            srcPath[sizeof(srcPath) - 1U] = '\0';
+        }
+
+        if (!ShellCopyParameter(pcCommandString, 3U, dstPath, sizeof(dstPath)))
+        {
+            if (!ShellBuildDefaultCsvPath(srcPath, dstPath, sizeof(dstPath)))
+            {
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Percorso destinazione non valido\r\n");
+                return pdFALSE;
+            }
+        }
+
+        if (!ShellPauseLoggingForExport(4000U))
+        {
+            s_logEnabled = resumeLogging;
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Timeout chiusura log attivo\r\n");
+            return pdFALSE;
+        }
+
+        fr = CanLogExportCsv(srcPath, dstPath, &exported);
+        s_logEnabled = resumeLogging;
+
+        if (fr != FR_OK)
+        {
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Export fallito: %s (%d)\r\n", FsResultToString(fr), (int)fr);
+            return pdFALSE;
+        }
+
+        (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Export completato: %lu record -> %s\r\n",
+                       (unsigned long)exported, dstPath);
+        return pdFALSE;
+    }
+
+    (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                   "Uso: log <status|on|off|usb <on|off>|autocan <on|off>|export ...>\r\n");
     return pdFALSE;
 }
 
 BaseType_t ShellCliSdCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
 {
     const char *subcmd;
+    const char *param;
     BaseType_t subcmdLen = 0;
+    BaseType_t paramLen = 0;
     bool forceRefresh = false;
     sd_usage_cache_t usage;
     TickType_t now;
     uint32_t ageMs = 0U;
     FRESULT fr;
     bool hasSnapshot;
+    char path[CAN_LOG_EXPORT_PATH_MAX];
+    DIR dir;
+    FILINFO info;
+    uint32_t totalMiB;
+    uint32_t freeMiB;
+    uint32_t usedMiB;
+    char totalHuman[24];
+    char freeHuman[24];
+    char usedHuman[24];
 
     subcmd = FreeRTOS_CLIGetParameter(pcCommandString, 1U, &subcmdLen);
     if (subcmd != NULL)
@@ -522,21 +1132,151 @@ BaseType_t ShellCliSdCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const 
         {
             forceRefresh = true;
         }
+        else if (ShellTokenEquals(subcmd, subcmdLen, "ls"))
+        {
+            char token[24];
+            uint32_t maxLines = 32U;
+            uint32_t shown = 0U;
+            bool truncated = false;
+
+            fr = ShellEnsureSdMountedForCli();
+            if (fr != FR_OK)
+            {
+                if (fr == FR_LOCKED)
+                {
+                    (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                                   "SD bloccata: esportata come disco USB (MSC). Usa il PC per leggere i file.\r\n");
+                }
+                else
+                {
+                    (void)snprintf(pcWriteBuffer, xWriteBufferLen, "SD non montata: %s (%d)\r\n",
+                                   FsResultToString(fr), (int)fr);
+                }
+                return pdFALSE;
+            }
+
+            param = FreeRTOS_CLIGetParameter(pcCommandString, 2U, &paramLen);
+            if ((param != NULL) && (paramLen > 0) && ((size_t)paramLen < sizeof(path)))
+            {
+                (void)memcpy(path, param, (size_t)paramLen);
+                path[paramLen] = '\0';
+
+                if (ShellParseU32Auto(path, &maxLines))
+                {
+                    (void)strncpy(path, "/", sizeof(path) - 1U);
+                    path[sizeof(path) - 1U] = '\0';
+                }
+            }
+            else
+            {
+                (void)strncpy(path, "/", sizeof(path) - 1U);
+                path[sizeof(path) - 1U] = '\0';
+            }
+
+            param = FreeRTOS_CLIGetParameter(pcCommandString, 3U, &paramLen);
+            if ((param != NULL) && (paramLen > 0) && ((size_t)paramLen < sizeof(token)))
+            {
+                (void)memcpy(token, param, (size_t)paramLen);
+                token[paramLen] = '\0';
+                if (!ShellParseU32Auto(token, &maxLines))
+                {
+                    (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: sd ls [path] [max]\r\n");
+                    return pdFALSE;
+                }
+            }
+
+            if (maxLines == 0U)
+            {
+                maxLines = 1U;
+            }
+            if (maxLines > 512U)
+            {
+                maxLines = 512U;
+            }
+
+            fr = f_opendir(&dir, path);
+            if (fr != FR_OK)
+            {
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen, "ls fallito: %s (%d)\r\n",
+                               FsResultToString(fr), (int)fr);
+                return pdFALSE;
+            }
+
+            ShellWriteLinef("Listing %s\r\n", path);
+            while (true)
+            {
+                const char *name;
+
+                fr = f_readdir(&dir, &info);
+                if (fr != FR_OK)
+                {
+                    (void)f_closedir(&dir);
+                    (void)snprintf(pcWriteBuffer, xWriteBufferLen, "readdir fallito: %s (%d)\r\n",
+                                   FsResultToString(fr), (int)fr);
+                    return pdFALSE;
+                }
+                if (info.fname[0] == '\0')
+                {
+                    break;
+                }
+
+                name = info.fname;
+                if (shown >= maxLines)
+                {
+                    truncated = true;
+                    break;
+                }
+                if ((info.fattrib & AM_DIR) != 0U)
+                {
+                    ShellWriteLinef("d %10s %s\r\n", "-", name);
+                }
+                else
+                {
+                    char sizeHuman[24];
+                    ShellFormatBytesHuman((uint64_t)info.fsize, sizeHuman, sizeof(sizeHuman));
+                    ShellWriteLinef("f %10s %s\r\n", sizeHuman, name);
+                }
+                shown++;
+            }
+            (void)f_closedir(&dir);
+
+            if (truncated)
+            {
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                               "ls completato: mostrati %lu file (limite=%lu, output troncato)\r\n",
+                               (unsigned long)shown, (unsigned long)maxLines);
+            }
+            else
+            {
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                               "ls completato: mostrati %lu file\r\n",
+                               (unsigned long)shown);
+            }
+            return pdFALSE;
+        }
         else if (!ShellTokenEquals(subcmd, subcmdLen, "status"))
         {
-            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: sd <status|refresh>\r\n");
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: sd <status|refresh|ls [path] [max]>\r\n");
             return pdFALSE;
         }
     }
 
-    if (!s_fsMounted)
+    fr = ShellEnsureSdMountedForCli();
+    if (fr != FR_OK)
     {
-        fr = FsMount();
-        if (fr != FR_OK)
+        if (fr == FR_LOCKED)
+        {
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                           "SD bloccata: esportata come disco USB (MSC). Usa il PC per leggere i file.\r\n");
+        }
+        else
         {
             (void)snprintf(pcWriteBuffer, xWriteBufferLen, "SD non montata: %s (%d)\r\n", FsResultToString(fr), (int)fr);
-            return pdFALSE;
         }
+        return pdFALSE;
+    }
+    if (!s_sdUsageCache.valid)
+    {
         forceRefresh = true;
     }
 
@@ -568,15 +1308,20 @@ BaseType_t ShellCliSdCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const 
 
     now = xTaskGetTickCount();
     ageMs = (uint32_t)((now - usage.tick) * portTICK_PERIOD_MS);
+    totalMiB = (uint32_t)(usage.totalBytes / (1024ULL * 1024ULL));
+    freeMiB  = (uint32_t)(usage.freeBytes / (1024ULL * 1024ULL));
+    usedMiB  = (uint32_t)(usage.usedBytes / (1024ULL * 1024ULL));
+    ShellFormatBytesHuman(usage.totalBytes, totalHuman, sizeof(totalHuman));
+    ShellFormatBytesHuman(usage.freeBytes, freeHuman, sizeof(freeHuman));
+    ShellFormatBytesHuman(usage.usedBytes, usedHuman, sizeof(usedHuman));
 
     (void)snprintf(pcWriteBuffer, xWriteBufferLen,
-                   "SD totale=%llu MiB libero=%llu MiB usato=%llu MiB (%u.%u%%) cache_age=%lu ms\r\n"
+                   "SD totale=%s libero=%s usato=%s (%u.%u%%) cache_age=%lu ms\r\n"
+                   "SD (raw) totale=%lu MiB libero=%lu MiB usato=%lu MiB\r\n"
                    "log=%s\r\n",
-                   (unsigned long long)(usage.totalBytes / (1024ULL * 1024ULL)),
-                   (unsigned long long)(usage.freeBytes / (1024ULL * 1024ULL)),
-                   (unsigned long long)(usage.usedBytes / (1024ULL * 1024ULL)),
+                   totalHuman, freeHuman, usedHuman,
                    (unsigned int)(usage.usedPermille / 10U), (unsigned int)(usage.usedPermille % 10U),
-                   (unsigned long)ageMs,
+                   (unsigned long)ageMs, (unsigned long)totalMiB, (unsigned long)freeMiB, (unsigned long)usedMiB,
                    (s_canLogFileOpen && (s_canLogActivePath[0] != '\0')) ? s_canLogActivePath : "(n/a)");
     return pdFALSE;
 }
@@ -686,9 +1431,21 @@ BaseType_t ShellCliTimeCommand(char *pcWriteBuffer, size_t xWriteBufferLen, cons
         BaseType_t paramLen = 0;
 
         param = FreeRTOS_CLIGetParameter(pcCommandString, 2U, &paramLen);
-        if ((param == NULL) || (paramLen <= 0) || ((size_t)paramLen >= sizeof(token)))
+        if ((param == NULL) || (paramLen <= 0))
         {
-            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: time [<unix_epoch>|status|set <unix_epoch>]\r\n");
+            unixSeconds = (uint32_t)APP_BUILD_UNIX_EPOCH;
+            if (unixSeconds < RTC_MIN_VALID_EPOCH)
+            {
+                (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                               "Epoch build non valido. Usa: time set <unix_epoch>\r\n");
+                return pdFALSE;
+            }
+            goto apply_time;
+        }
+
+        if ((size_t)paramLen >= sizeof(token))
+        {
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: time [<unix_epoch>|status|set [unix_epoch]]\r\n");
             return pdFALSE;
         }
 
@@ -699,7 +1456,7 @@ BaseType_t ShellCliTimeCommand(char *pcWriteBuffer, size_t xWriteBufferLen, cons
     {
         if ((subcmdLen <= 0) || ((size_t)subcmdLen >= sizeof(token)))
         {
-            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: time [<unix_epoch>|status|set <unix_epoch>]\r\n");
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: time [<unix_epoch>|status|set [unix_epoch]]\r\n");
             return pdFALSE;
         }
         (void)memcpy(token, subcmd, (size_t)subcmdLen);
@@ -712,6 +1469,7 @@ BaseType_t ShellCliTimeCommand(char *pcWriteBuffer, size_t xWriteBufferLen, cons
         return pdFALSE;
     }
 
+apply_time:
     if (!RtcSetUnixSeconds(unixSeconds))
     {
         (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Errore impostazione RTC\r\n");
@@ -719,9 +1477,59 @@ BaseType_t ShellCliTimeCommand(char *pcWriteBuffer, size_t xWriteBufferLen, cons
     }
 
     (void)RtcUnixSecondsToDateTime(unixSeconds, &dt);
-    (void)snprintf(pcWriteBuffer, xWriteBufferLen, "RTC impostato: %lu (%04u-%02u-%02u %02u:%02u:%02u UTC)\r\n",
+    (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                   "RTC impostato: %lu (%04u-%02u-%02u %02u:%02u:%02u UTC)\r\n",
                    (unsigned long)unixSeconds, (unsigned int)dt.year, (unsigned int)dt.month, (unsigned int)dt.day,
                    (unsigned int)dt.hour, (unsigned int)dt.minute, (unsigned int)dt.second);
+    return pdFALSE;
+}
+
+BaseType_t ShellCliBootCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString)
+{
+    const char *subcmd;
+    BaseType_t subcmdLen = 0;
+
+    subcmd = FreeRTOS_CLIGetParameter(pcCommandString, 1U, &subcmdLen);
+    if ((subcmd == NULL) || ShellTokenEquals(subcmd, subcmdLen, "status"))
+    {
+        if (s_bootloaderRebootPending)
+        {
+            TickType_t now = xTaskGetTickCount();
+            uint32_t remainingMs = 0U;
+
+            if (s_bootloaderRebootDeadline > now)
+            {
+                remainingMs = (uint32_t)((s_bootloaderRebootDeadline - now) * portTICK_PERIOD_MS);
+            }
+
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                           "bootloader pending=1 eta=%lu ms\r\n",
+                           (unsigned long)remainingMs);
+        }
+        else
+        {
+            (void)snprintf(pcWriteBuffer, xWriteBufferLen, "bootloader pending=0\r\n");
+        }
+        return pdFALSE;
+    }
+
+    if (ShellTokenEquals(subcmd, subcmdLen, "go") || ShellTokenEquals(subcmd, subcmdLen, "now"))
+    {
+        AppRequestBootloaderReboot(BOOTLOADER_REBOOT_DELAY_CLI_MS);
+        (void)snprintf(pcWriteBuffer, xWriteBufferLen,
+                       "Riavvio in bootloader richiesto (%lu ms)\r\n",
+                       (unsigned long)BOOTLOADER_REBOOT_DELAY_CLI_MS);
+        return pdFALSE;
+    }
+
+    if (ShellTokenEquals(subcmd, subcmdLen, "cancel"))
+    {
+        AppCancelBootloaderReboot();
+        (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Richiesta bootloader annullata\r\n");
+        return pdFALSE;
+    }
+
+    (void)snprintf(pcWriteBuffer, xWriteBufferLen, "Uso: bootloader <status|go|cancel>\r\n");
     return pdFALSE;
 }
 
@@ -781,27 +1589,28 @@ uint32_t GsCpuToWire32(uint32_t value)
 
 bool GsCanQueueFrame(const gs_host_frame_classic_t *frame)
 {
-    bool queued = false;
-
-    if (frame == NULL)
+    if (APP_UNLIKELY(frame == NULL))
     {
         return false;
     }
 
     taskENTER_CRITICAL();
-    if (s_gsCanTxCount >= GS_USB_FRAME_QUEUE_LENGTH)
+    if (APP_UNLIKELY(s_gsCanTxCount >= GS_USB_FRAME_QUEUE_LENGTH))
     {
         taskEXIT_CRITICAL();
         return false;
     }
 
     s_gsCanTxQueue[s_gsCanTxHead] = *frame;
-    s_gsCanTxHead                 = (uint16_t)((s_gsCanTxHead + 1U) % GS_USB_FRAME_QUEUE_LENGTH);
+    s_gsCanTxHead++;
+    if (s_gsCanTxHead >= GS_USB_FRAME_QUEUE_LENGTH)
+    {
+        s_gsCanTxHead = 0U;
+    }
     s_gsCanTxCount++;
-    queued = true;
     taskEXIT_CRITICAL();
 
-    return queued;
+    return true;
 }
 
 void GsCanTrySendNext(void)
@@ -809,7 +1618,12 @@ void GsCanTrySendNext(void)
     gs_host_frame_classic_t nextFrame;
     usb_status_t status;
 
-    if (!s_gsCanConfigured || !s_gsCanEpReady || s_gsCanInBusy || (s_cdcState.attach == 0U) || (s_cdcState.deviceHandle == NULL))
+    if (APP_UNLIKELY(!s_gsCanConfigured || !s_gsCanEpReady || s_gsCanInBusy))
+    {
+        return;
+    }
+
+    if (APP_UNLIKELY((s_cdcState.attach == 0U) || (s_cdcState.deviceHandle == NULL)))
     {
         return;
     }
@@ -820,24 +1634,34 @@ void GsCanTrySendNext(void)
         taskEXIT_CRITICAL();
         return;
     }
-
     nextFrame = s_gsCanTxQueue[s_gsCanTxTail];
-    s_gsCanTxTail = (uint16_t)((s_gsCanTxTail + 1U) % GS_USB_FRAME_QUEUE_LENGTH);
+    s_gsCanTxTail++;
+    if (s_gsCanTxTail >= GS_USB_FRAME_QUEUE_LENGTH)
+    {
+        s_gsCanTxTail = 0U;
+    }
     s_gsCanTxCount--;
     taskEXIT_CRITICAL();
 
-    s_gsCanInFrame = nextFrame;
+    s_gsCanInFrames[0] = nextFrame;
+
     s_gsCanInBusy  = true;
     status = USB_DeviceSendRequest(s_cdcState.deviceHandle, (uint8_t)(USB_GS_CAN_BULK_IN_ENDPOINT | (USB_IN << 7U)),
-                                   (uint8_t *)&s_gsCanInFrame, sizeof(s_gsCanInFrame));
+                                   (uint8_t *)&s_gsCanInFrames[0], sizeof(gs_host_frame_classic_t));
     if (status != kStatus_USB_Success)
     {
         s_gsCanInBusy = false;
-        /* Keep frame for retry instead of dropping it when host side is temporarily busy. */
         taskENTER_CRITICAL();
         if (s_gsCanTxCount < GS_USB_FRAME_QUEUE_LENGTH)
         {
-            s_gsCanTxTail = (uint16_t)((s_gsCanTxTail + GS_USB_FRAME_QUEUE_LENGTH - 1U) % GS_USB_FRAME_QUEUE_LENGTH);
+            if (s_gsCanTxTail == 0U)
+            {
+                s_gsCanTxTail = (uint16_t)(GS_USB_FRAME_QUEUE_LENGTH - 1U);
+            }
+            else
+            {
+                s_gsCanTxTail--;
+            }
             s_gsCanTxQueue[s_gsCanTxTail] = nextFrame;
             s_gsCanTxCount++;
         }
@@ -857,12 +1681,10 @@ bool GsCanRxPublish(size_t busIndex, const flexcan_frame_t *frame, status_t stat
 {
     gs_host_frame_classic_t hostFrame;
     uint32_t canId;
-    uint8_t data[8];
-    uint8_t i;
     uint8_t dlc;
-    bool queued;
 
-    if ((frame == NULL) || (busIndex >= GS_USB_CHANNEL_COUNT) || !s_gsCanConfigured || !s_canBuses[busIndex].started)
+    if (APP_UNLIKELY((frame == NULL) || (busIndex >= GS_USB_CHANNEL_COUNT) || !s_gsCanConfigured ||
+                     !s_canBuses[busIndex].started))
     {
         return false;
     }
@@ -882,15 +1704,6 @@ bool GsCanRxPublish(size_t busIndex, const flexcan_frame_t *frame, status_t stat
         dlc = 8U;
     }
 
-    data[0] = frame->dataByte0;
-    data[1] = frame->dataByte1;
-    data[2] = frame->dataByte2;
-    data[3] = frame->dataByte3;
-    data[4] = frame->dataByte4;
-    data[5] = frame->dataByte5;
-    data[6] = frame->dataByte6;
-    data[7] = frame->dataByte7;
-
     (void)memset(&hostFrame, 0, sizeof(hostFrame));
     hostFrame.echoId  = GsCpuToWire32(GS_HOST_FRAME_ECHO_ID_RX);
     hostFrame.canId   = GsCpuToWire32(canId);
@@ -898,23 +1711,27 @@ bool GsCanRxPublish(size_t busIndex, const flexcan_frame_t *frame, status_t stat
     hostFrame.channel = (uint8_t)busIndex;
     hostFrame.flags   = 0U;
 
-    if ((status == kStatus_FLEXCAN_RxOverflow) || s_gsCanOverflowPending[busIndex])
+    if (APP_UNLIKELY((status == kStatus_FLEXCAN_RxOverflow) || s_gsCanOverflowPending[busIndex]))
     {
         hostFrame.flags |= GS_CAN_FLAG_OVERFLOW;
         s_gsCanOverflowPending[busIndex] = false;
     }
 
-    for (i = 0U; i < dlc; i++)
-    {
-        hostFrame.data[i] = data[i];
-    }
+    hostFrame.data[0] = frame->dataByte0;
+    hostFrame.data[1] = frame->dataByte1;
+    hostFrame.data[2] = frame->dataByte2;
+    hostFrame.data[3] = frame->dataByte3;
+    hostFrame.data[4] = frame->dataByte4;
+    hostFrame.data[5] = frame->dataByte5;
+    hostFrame.data[6] = frame->dataByte6;
+    hostFrame.data[7] = frame->dataByte7;
 
-    queued = GsCanQueueFrame(&hostFrame);
-    if (!queued)
+    if (APP_UNLIKELY(!GsCanQueueFrame(&hostFrame)))
     {
         GsCanSetOverflowFlag(busIndex);
+        return false;
     }
-    return queued;
+    return true;
 }
 
 bool GsCanTxEchoPublish(size_t busIndex, uint32_t echoId, const flexcan_frame_t *frame)
@@ -922,10 +1739,8 @@ bool GsCanTxEchoPublish(size_t busIndex, uint32_t echoId, const flexcan_frame_t 
     gs_host_frame_classic_t hostFrame;
     uint32_t canId;
     uint8_t dlc;
-    uint8_t i;
-    uint8_t data[8];
 
-    if ((frame == NULL) || (busIndex >= GS_USB_CHANNEL_COUNT) || !s_gsCanConfigured)
+    if (APP_UNLIKELY((frame == NULL) || (busIndex >= GS_USB_CHANNEL_COUNT) || !s_gsCanConfigured))
     {
         return false;
     }
@@ -949,25 +1764,19 @@ bool GsCanTxEchoPublish(size_t busIndex, uint32_t echoId, const flexcan_frame_t 
         dlc = 8U;
     }
 
-    data[0] = frame->dataByte0;
-    data[1] = frame->dataByte1;
-    data[2] = frame->dataByte2;
-    data[3] = frame->dataByte3;
-    data[4] = frame->dataByte4;
-    data[5] = frame->dataByte5;
-    data[6] = frame->dataByte6;
-    data[7] = frame->dataByte7;
-
     (void)memset(&hostFrame, 0, sizeof(hostFrame));
     hostFrame.echoId  = GsCpuToWire32(echoId);
     hostFrame.canId   = GsCpuToWire32(canId);
     hostFrame.canDlc  = dlc;
     hostFrame.channel = (uint8_t)busIndex;
-
-    for (i = 0U; i < dlc; i++)
-    {
-        hostFrame.data[i] = data[i];
-    }
+    hostFrame.data[0] = frame->dataByte0;
+    hostFrame.data[1] = frame->dataByte1;
+    hostFrame.data[2] = frame->dataByte2;
+    hostFrame.data[3] = frame->dataByte3;
+    hostFrame.data[4] = frame->dataByte4;
+    hostFrame.data[5] = frame->dataByte5;
+    hostFrame.data[6] = frame->dataByte6;
+    hostFrame.data[7] = frame->dataByte7;
 
     return GsCanQueueFrame(&hostFrame);
 }

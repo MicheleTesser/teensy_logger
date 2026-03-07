@@ -31,6 +31,7 @@
 #include "usb_device.h"
 #include "usb_device_class.h"
 #include "usb_device_cdc_acm.h"
+#include "usb_device_msc.h"
 #include "usb_device_ch9.h"
 #include "usb_device_descriptor.h"
 #include "usb_phy.h"
@@ -71,7 +72,7 @@
 #define LED_TASK_STACK_WORDS 256U
 #define LED_TASK_PRIORITY    (tskIDLE_PRIORITY + 2U)
 #define CAN_TASK_STACK_WORDS 1280U
-#define CAN_TASK_PRIORITY    (tskIDLE_PRIORITY + 2U)
+#define CAN_TASK_PRIORITY    (tskIDLE_PRIORITY + 3U)
 
 #define LED_ACTIVITY_PULSE_MS   60U
 #define CAN_HEARTBEAT_PERIOD_MS 100U
@@ -81,6 +82,8 @@
 #define CAN_SHELL_TX_MB         9U
 #define CAN_RX_STD_MB           10U
 #define CAN_RX_EXT_MB           11U
+#define CAN_GS_TX_MB_FIRST      12U
+#define CAN_GS_TX_MB_LAST       31U
 #define CAN1_HEARTBEAT_ID       0x321U
 #define CAN2_HEARTBEAT_ID       0x322U
 #define CAN_AUTOSTART_RETRY_MS  1000U
@@ -88,7 +91,10 @@
 #define SHELL_PROMPT           "usb-shell> "
 #define SHELL_LINE_BUFFER_SIZE 256U
 #define SHELL_TX_LINE_SIZE     128U
-#define SHELL_CLI_OUTPUT_SIZE  512U
+#define SHELL_CLI_OUTPUT_SIZE  1024U
+#define BOOTLOADER_BAUD_TRIGGER 134U
+#define BOOTLOADER_REBOOT_DELAY_MS 120U
+#define BOOTLOADER_REBOOT_DELAY_CLI_MS 200U
 
 #define FS_BENCH_FILE_PATH    "/bench.bin"
 #define FS_BENCH_BUFFER_SIZE  4096U
@@ -96,6 +102,10 @@
 #define FS_BENCH_DEFAULT_RUNS 1U
 
 #define CAN_UTIL_UPDATE_MS       200U
+#define CAN_ISR_RX_FIFO_LENGTH   1024U
+#define CAN_ISR_RX_FIFO_MASK     (CAN_ISR_RX_FIFO_LENGTH - 1U)
+#define CAN_GS_TX_QUEUE_LENGTH   2048U
+#define CAN_GS_TX_QUEUE_MASK     (CAN_GS_TX_QUEUE_LENGTH - 1U)
 
 #define CAN_LOG_TASK_STACK_WORDS    768U
 #define CAN_LOG_TASK_PRIORITY       (tskIDLE_PRIORITY + 2U)
@@ -103,8 +113,10 @@
 #define CAN_LOG_FLUSH_PERIOD_MS     1000U
 #define CAN_LOG_MOUNT_RETRY_MS      1000U
 #define CAN_LOG_SYNC_FRAME_INTERVAL 64U
+#define CAN_LOG_USB_DETECT_GRACE_MS 2500U
 #define CAN_LOG_RECORD_SIZE_BYTES   24U
 #define CAN_LOG_PATH_MAX            32U
+#define CAN_LOG_EXPORT_PATH_MAX     96U
 #define CAN_LOG_MAX_SEQ_INDEX       100000U
 
 #define SD_USAGE_CACHE_TTL_MS       5000U
@@ -185,7 +197,7 @@
 #define GS_HOST_FRAME_ECHO_ID_RX     0xFFFFFFFFUL
 #define GS_USB_CHANNEL_COUNT         2U
 #define GS_USB_MAX_PACKET_SIZE       HS_GS_CAN_BULK_OUT_PACKET_SIZE
-#define GS_USB_FRAME_QUEUE_LENGTH    256U
+#define GS_USB_FRAME_QUEUE_LENGTH    2048U
 
 #define GS_CAN_DEFERRED_OP_NONE  (0U)
 #define GS_CAN_DEFERRED_OP_START (1U)
@@ -195,6 +207,14 @@
 #define PACKED_STRUCT __attribute__((packed))
 #else
 #define PACKED_STRUCT
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define APP_LIKELY(x)   (__builtin_expect(!!(x), 1))
+#define APP_UNLIKELY(x) (__builtin_expect(!!(x), 0))
+#else
+#define APP_LIKELY(x)   (x)
+#define APP_UNLIKELY(x) (x)
 #endif
 
 /* CDC line coding defaults (115200 8N1). */
@@ -321,6 +341,9 @@ typedef struct PACKED_STRUCT
     uint8_t data[8];
 } gs_host_frame_classic_t;
 
+#define GS_USB_HOST_FRAME_SIZE          ((uint32_t)sizeof(gs_host_frame_classic_t))
+#define GS_USB_MAX_FRAMES_PER_TRANSFER  (GS_USB_MAX_PACKET_SIZE / GS_USB_HOST_FRAME_SIZE)
+
 typedef struct
 {
     uint64_t timestampNs;
@@ -382,6 +405,20 @@ typedef struct
     volatile uint8_t pending;
 } gs_can_deferred_request_t;
 
+typedef struct
+{
+    flexcan_frame_t frame;
+    status_t status;
+} can_isr_rx_entry_t;
+typedef char can_isr_fifo_length_pow2_must_hold[((CAN_ISR_RX_FIFO_LENGTH & (CAN_ISR_RX_FIFO_LENGTH - 1U)) == 0U) ? 1 : -1];
+
+typedef struct
+{
+    flexcan_frame_t frame;
+    uint32_t echoId;
+} can_gs_tx_entry_t;
+typedef char can_gs_tx_queue_length_pow2_must_hold[((CAN_GS_TX_QUEUE_LENGTH & (CAN_GS_TX_QUEUE_LENGTH - 1U)) == 0U) ? 1 : -1];
+
 /* Cross-module function declarations */
 void AppTask(void *pvParameters);
 void LedTask(void *pvParameters);
@@ -406,7 +443,12 @@ BaseType_t ShellCliSdCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const 
 BaseType_t ShellCliRtcCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString);
 BaseType_t ShellCliTimeCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString);
 BaseType_t ShellCliLogCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString);
+BaseType_t ShellCliBootCommand(char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString);
 void LedMarkCanActivity(void);
+void AppRequestBootloaderReboot(uint32_t delayMs);
+void AppCancelBootloaderReboot(void);
+void AppProcessBootloaderReboot(void);
+void AppRebootToBootloaderNow(void) __attribute__((noreturn));
 
 FRESULT FsMount(void);
 FRESULT FsUnmount(void);
@@ -441,6 +483,9 @@ status_t CanInitOneWithFlags(can_bus_context_t *bus, uint32_t bitRate, uint32_t 
 status_t CanDeinitOne(can_bus_context_t *bus);
 void CanPollRxDump(void);
 void CanPollRxMb(can_bus_context_t *bus, size_t busIndex, uint8_t mbIdx);
+void CanRxFifoReset(size_t busIndex);
+bool CanRxFifoPop(size_t busIndex, flexcan_frame_t *frame, status_t *status);
+bool CanProcessRxFifo(uint32_t budgetPerBus);
 void CanHandleRxFrame(size_t busIndex, const flexcan_frame_t *frame, status_t status);
 void CanDumpPrintFrame(size_t busIndex, const flexcan_frame_t *frame, status_t status);
 uint32_t CanEstimateFrameBits(const flexcan_frame_t *frame);
@@ -469,6 +514,10 @@ void GsCanProcessDeferredRequests(void);
 void GsCanSetOverflowFlag(size_t busIndex);
 bool GsCanRxPublish(size_t busIndex, const flexcan_frame_t *frame, status_t status);
 bool GsCanTxEchoPublish(size_t busIndex, uint32_t echoId, const flexcan_frame_t *frame);
+void GsCanTxQueueReset(size_t busIndex);
+bool GsCanTxQueuePush(size_t busIndex, uint32_t echoId, const flexcan_frame_t *frame);
+bool GsCanServiceTxQueues(uint32_t budgetPerBus);
+bool GsCanTxQueueHasPending(void);
 usb_status_t USB_GsCanBulkOutCallback(usb_device_handle handle,
                                              usb_device_endpoint_callback_message_struct_t *message,
                                              void *callbackParam);
@@ -492,10 +541,12 @@ bool Mf4RecoverFile(FIL *file, mf4_log_state_t *state);
 bool Mf4PatchCounters(FIL *file, const mf4_log_state_t *state);
 bool Mf4Sync(FIL *file, const mf4_log_state_t *state);
 bool CanLogOpenFile(FIL *file, mf4_log_state_t *state);
+FRESULT CanLogExportCsv(const char *srcPath, const char *dstPath, uint32_t *recordsWritten);
 
 bool CanLogEnqueue(size_t busIndex, const flexcan_frame_t *frame, status_t status);
 
 usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, void *param);
+usb_status_t USB_DeviceMscCallback(class_handle_t handle, uint32_t event, void *param);
 usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *param);
 
 DWORD get_fattime(void);
@@ -503,7 +554,9 @@ DWORD get_fattime(void);
 /* Shared globals */
 extern usb_device_endpoint_struct_t g_UsbDeviceCdcVcomDicEndpoints[];
 extern usb_device_endpoint_struct_t g_UsbDeviceGsCanEndpoints[];
+extern usb_device_endpoint_struct_t g_UsbDeviceMscDiskEndpoints[];
 extern usb_device_class_struct_t g_UsbDeviceCdcVcomConfig;
+extern usb_device_class_struct_t g_UsbDeviceMscDiskConfig;
 extern void USDHC1_DriverIRQHandler(void);
 
 extern usb_cdc_shell_state_t s_cdcState;
@@ -515,7 +568,7 @@ extern uint8_t s_countryCode[COMM_FEATURE_DATA_SIZE];
 extern uint8_t s_recvBuffer[DATA_BUFF_SIZE];
 extern uint8_t s_sendBuffer[DATA_BUFF_SIZE];
 extern uint8_t s_gsCanOutBuffer[GS_USB_MAX_PACKET_SIZE];
-extern gs_host_frame_classic_t s_gsCanInFrame;
+extern gs_host_frame_classic_t s_gsCanInFrames[GS_USB_MAX_FRAMES_PER_TRANSFER];
 
 extern volatile uint32_t s_recvSize;
 extern volatile uint8_t s_txBusy;
@@ -526,6 +579,8 @@ extern volatile bool s_ledActivitySeen;
 extern volatile bool s_cdcOutPrimed;
 extern volatile uint32_t s_gsCanOutSize;
 extern volatile bool s_rtcInitialized;
+extern volatile bool s_bootloaderRebootPending;
+extern volatile TickType_t s_bootloaderRebootDeadline;
 extern bool s_shellCliReady;
 extern TickType_t s_canUtilLastTick;
 extern bool s_canUtilInitialized;
@@ -537,7 +592,7 @@ extern bool s_fsConfigured;
 extern bool s_fsMounted;
 extern const TCHAR s_fsDrive[];
 extern FIL s_canLogFile;
-extern bool s_canLogFileOpen;
+extern volatile bool s_canLogFileOpen;
 extern char s_canLogActivePath[CAN_LOG_PATH_MAX];
 extern uint32_t s_canLogNextIndex;
 extern mf4_log_state_t s_mf4LogState;
@@ -553,6 +608,7 @@ extern volatile uint32_t s_canModeFlags;
 extern volatile bool s_canAutoStartEnabled;
 extern volatile bool s_logEnabled;
 extern volatile bool s_logAllowWhenUsbAttached;
+extern volatile bool s_mscHostActive;
 
 extern QueueHandle_t s_canLogQueue;
 extern SemaphoreHandle_t s_shellTxMutex;
@@ -568,6 +624,16 @@ extern volatile uint16_t s_gsCanTxCount;
 extern volatile bool s_gsCanOverflowPending[GS_USB_CHANNEL_COUNT];
 extern gs_host_frame_classic_t s_gsCanTxQueue[GS_USB_FRAME_QUEUE_LENGTH];
 extern gs_can_deferred_request_t s_gsCanDeferredReq[GS_USB_CHANNEL_COUNT];
+
+extern volatile uint16_t s_canRxFifoHead[GS_USB_CHANNEL_COUNT];
+extern volatile uint16_t s_canRxFifoTail[GS_USB_CHANNEL_COUNT];
+extern volatile bool s_canRxFifoOverflow[GS_USB_CHANNEL_COUNT];
+extern can_isr_rx_entry_t s_canRxFifo[GS_USB_CHANNEL_COUNT][CAN_ISR_RX_FIFO_LENGTH];
+extern volatile uint16_t s_canGsTxHead[GS_USB_CHANNEL_COUNT];
+extern volatile uint16_t s_canGsTxTail[GS_USB_CHANNEL_COUNT];
+extern volatile uint16_t s_canGsTxCount[GS_USB_CHANNEL_COUNT];
+extern volatile uint8_t s_canGsTxMbCursor[GS_USB_CHANNEL_COUNT];
+extern can_gs_tx_entry_t s_canGsTxQueue[GS_USB_CHANNEL_COUNT][CAN_GS_TX_QUEUE_LENGTH];
 
 extern gs_host_config_t s_gsHostConfig;
 extern gs_device_bittiming_t s_gsBitTiming;

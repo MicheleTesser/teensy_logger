@@ -69,7 +69,7 @@ typedef struct _ivt_
 extern uint32_t __Vectors[];
 #define IMAGE_ENTRY_ADDRESS ((uint32_t)__Vectors)
 #elif defined(__MCUXPRESSO)
-extern uint32_t __Vectors[];
+extern void (* const __Vectors[])(void);
 #define IMAGE_ENTRY_ADDRESS ((uint32_t)__Vectors)
 #elif defined(__ICCARM__)
 extern uint32_t __VECTOR_TABLE[];
